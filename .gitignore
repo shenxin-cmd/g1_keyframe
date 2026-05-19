@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+recordings/*.npz
+keyframes/
+g1/
+go2/
+MUJOCO_LOG.TXT
+*.mp4
+.DS_Store
