@@ -16,6 +16,10 @@ G1 右手轨迹生成器
 
   # 预览窗口内按 P 键保存 NPZ；或加 --save 参数自动保存
 
+  # 导出 MP4（离屏渲染，无需录屏）
+  python g1_traj_gen.py --mode circle --x 0.30 --cy -0.15 --cz 0.90 --radius 0.07 --video
+  python g1_traj_gen.py --mode circle ... --video recordings/demo.mp4 --save --no-preview
+
 约束说明（与 g1_recorder.py 的腕锁一致）：
   活动关节（3 DOF）：right_shoulder_pitch, right_shoulder_roll, right_elbow
   锁定关节（保持0）：right_shoulder_yaw, right_wrist_roll/pitch/yaw
@@ -30,6 +34,13 @@ import time
 import mujoco
 import mujoco.viewer
 import numpy as np
+
+try:
+    import imageio.v2 as imageio
+    HAS_IMAGEIO = True
+except ImportError:
+    imageio = None
+    HAS_IMAGEIO = False
 
 # matplotlib 仅工作空间分析时使用，懒导入
 os.makedirs("recordings", exist_ok=True)
@@ -526,12 +537,150 @@ def generate_ik_trajectory(waypoints, fps=100.0):
 
 
 # ══════════════════════════════════════════════
+# 可视化辅助 / 保存 / 视频
+# ══════════════════════════════════════════════
+
+def _waypoint_vis_points(waypoints, max_pts=300):
+    step = max(1, len(waypoints) // max_pts)
+    return waypoints[::step]
+
+
+def _add_waypoint_markers(scene, vis_pts):
+    """Draw red target waypoints into an MjvScene (viewer or renderer)."""
+    for wp in vis_pts:
+        if scene.ngeom >= scene.maxgeom:
+            break
+        g = scene.geoms[scene.ngeom]
+        mujoco.mjv_initGeom(
+            g,
+            mujoco.mjtGeom.mjGEOM_SPHERE,
+            np.array([0.007, 0.0, 0.0]),
+            np.zeros(3),
+            np.eye(3).flatten(),
+            np.array([1.0, 0.15, 0.15, 0.7], dtype=np.float32),
+        )
+        g.pos[:] = wp
+        scene.ngeom += 1
+
+
+def _m_to_name_tag(meters: float) -> str:
+    """Meters -> integer cm tag, e.g. 0.30->30, -0.15->15 (abs, for filenames)."""
+    return str(int(round(abs(meters) * 100)))
+
+
+def trajectory_output_stem(mode, x, cy, cz, radius=None, half=None):
+    """
+    Parameter-based filename stem, e.g.
+      circle x=0.30 cy=-0.15 cz=0.90 r=0.07 -> recordings/g1_circle_30_15_90_7
+      square x=0.30 cy=-0.15 cz=0.90 half=0.10 -> recordings/g1_square_30_15_90_10
+    """
+    tags = [_m_to_name_tag(x), _m_to_name_tag(cy), _m_to_name_tag(cz)]
+    if mode == "circle":
+        tags.append(_m_to_name_tag(radius))
+    else:
+        tags.append(_m_to_name_tag(half))
+    return os.path.join("recordings", f"g1_{mode}_{'_'.join(tags)}")
+
+
+def save_trajectory_npz(qpos_arr, qvel_arr, timestamps, traj_type, fps,
+                        out_path=None):
+    """Save trajectory NPZ compatible with g1_player.py."""
+    if out_path is None:
+        raise ValueError("out_path is required (use trajectory_output_stem)")
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    np.savez_compressed(
+        out_path,
+        qpos=qpos_arr,
+        qvel=qvel_arr,
+        timestamps=timestamps,
+        record_dt=np.float32(1.0 / fps),
+    )
+    n = len(qpos_arr)
+    print(f"\n轨迹已保存 → {out_path}")
+    print(f"  帧数: {n}  |  帧率: {fps:.0f} Hz  |  时长: {n/fps:.1f}s")
+    print(f"  可用命令回放：python g1_player.py --traj {out_path}")
+    return out_path
+
+
+def render_trajectory_video(qpos_arr, qvel_arr, waypoints, video_path,
+                            traj_fps=100.0, video_fps=30.0,
+                            width=1280, height=720):
+    """
+    Offscreen render trajectory to MP4 (no viewer window needed).
+    Red spheres = target waypoints; camera tracks pelvis.
+    """
+    if not HAS_IMAGEIO:
+        raise RuntimeError("imageio not installed.  pip install imageio imageio-ffmpeg")
+
+    model = mujoco.MjModel.from_xml_path(MODEL_PATH)
+    if width > model.vis.global_.offwidth:
+        model.vis.global_.offwidth = width
+    if height > model.vis.global_.offheight:
+        model.vis.global_.offheight = height
+    data = mujoco.MjData(model)
+    renderer = mujoco.Renderer(model, height=height, width=width)
+
+    camera = mujoco.MjvCamera()
+    camera.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+    camera.trackbodyid = mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_BODY, "pelvis"
+    )
+    camera.distance = 2.5
+    camera.elevation = -20.0
+    camera.azimuth = -140.0
+
+    vis_pts = _waypoint_vis_points(waypoints)
+    frame_step = max(1, round(traj_fps / video_fps))
+    indices = list(range(0, len(qpos_arr), frame_step))
+    if indices[-1] != len(qpos_arr) - 1:
+        indices.append(len(qpos_arr) - 1)
+
+    print(f"\n[Video] rendering {len(indices)} frames -> {video_path}")
+    print(f"  trajectory {traj_fps:.0f} Hz, video {video_fps:.0f} fps, "
+          f"{width}x{height}")
+
+    frames = []
+    try:
+        for k, i in enumerate(indices):
+            data.qpos[:] = qpos_arr[i]
+            data.qvel[:] = qvel_arr[i]
+            mujoco.mj_forward(model, data)
+
+            renderer.update_scene(data, camera=camera)
+            _add_waypoint_markers(renderer.scene, vis_pts)
+            frames.append(renderer.render())
+
+            if (k + 1) % 50 == 0 or k + 1 == len(indices):
+                print(f"  {k+1}/{len(indices)} frames", end="\r")
+        print()
+    finally:
+        renderer.close()
+
+    os.makedirs(os.path.dirname(video_path) or ".", exist_ok=True)
+    ext = os.path.splitext(video_path)[1].lower()
+    if ext not in (".mp4", ".gif", ".webm"):
+        video_path = video_path + ".mp4"
+
+    try:
+        imageio.mimsave(video_path, frames, fps=float(video_fps))
+    except Exception as exc:
+        gif_path = os.path.splitext(video_path)[0] + ".gif"
+        print(f"  MP4 save failed ({exc}), falling back to GIF -> {gif_path}")
+        imageio.mimsave(gif_path, frames, fps=float(video_fps))
+        video_path = gif_path
+
+    duration = len(frames) / float(video_fps)
+    print(f"  Video saved -> {video_path}  ({len(frames)} frames, {duration:.1f}s)")
+    return video_path
+
+
+# ══════════════════════════════════════════════
 # MuJoCo 预览
 # ══════════════════════════════════════════════
 
 def preview_trajectory(qpos_arr, qvel_arr, timestamps,
                        waypoints, traj_type, fps,
-                       auto_save=False):
+                       out_path=None, auto_save=False):
     """
     在 MuJoCo 场景窗口预览生成的轨迹。
     - 红色小球：目标轨迹点云
@@ -554,9 +703,7 @@ def preview_trajectory(qpos_arr, qvel_arr, timestamps,
     print("  红色点云 = 目标轨迹；机器人跟随轨迹运动")
     print("  按 P 键保存 NPZ；ESC 键退出")
 
-    # 目标点可视化（降采样到最多 300 个点，避免太卡）
-    vis_step = max(1, len(waypoints) // 300)
-    vis_pts  = waypoints[::vis_step]
+    vis_pts = _waypoint_vis_points(waypoints)
 
     with mujoco.viewer.launch_passive(
         model, data, key_callback=key_cb
@@ -573,24 +720,10 @@ def preview_trajectory(qpos_arr, qvel_arr, timestamps,
                 data.qvel[:] = qvel_arr[i]
                 mujoco.mj_forward(model, data)
 
-                # 绘制目标轨迹点云
                 try:
                     scn = viewer.user_scn
                     scn.ngeom = 0
-                    for wp in vis_pts:
-                        if scn.ngeom >= scn.maxgeom - 1:
-                            break
-                        g = scn.geoms[scn.ngeom]
-                        mujoco.mjv_initGeom(
-                            g,
-                            mujoco.mjtGeom.mjGEOM_SPHERE,
-                            np.zeros(3), np.zeros(3),
-                            np.eye(3).flatten(),
-                            np.array([1.0, 0.15, 0.15, 0.7], dtype=np.float32),
-                        )
-                        g.pos[:]  = wp
-                        g.size[:] = [0.007, 0.007, 0.007]
-                        scn.ngeom += 1
+                    _add_waypoint_markers(scn, vis_pts)
                 except Exception:
                     pass
 
@@ -611,20 +744,10 @@ def preview_trajectory(qpos_arr, qvel_arr, timestamps,
                     time.sleep(0.02)
                 break
 
-    # 保存
     if save_flag[0] or auto_save:
-        ts   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join("recordings", f"g1_{traj_type}_{ts}.npz")
-        np.savez_compressed(
-            path,
-            qpos       = qpos_arr,
-            qvel       = qvel_arr,
-            timestamps = timestamps,
-            record_dt  = np.float32(1.0 / fps),
-        )
-        print(f"\n轨迹已保存 → {path}")
-        print(f"  帧数: {N}  |  帧率: {fps:.0f} Hz  |  时长: {N/fps:.1f}s")
-        print(f"  可用命令回放：python g1_player.py --traj {path}")
+        if out_path is None:
+            raise ValueError("out_path is required when saving from preview")
+        save_trajectory_npz(qpos_arr, qvel_arr, timestamps, traj_type, fps, out_path)
     else:
         print("\n[预览] 未保存（在预览窗口按 P 键可保存）")
 
@@ -654,6 +777,12 @@ def main():
                    help="帧率 Hz（默认 100，与录制器一致）")
     p.add_argument("--save",   action="store_true",
                    help="跳过预览确认，直接保存 NPZ")
+    p.add_argument("--video",  nargs="?", const="", default=None, metavar="PATH",
+                   help="导出 MP4（可选路径；默认与 NPZ 同名 .mp4，如 g1_circle_30_15_90_7.mp4）")
+    p.add_argument("--video-fps", type=float, default=30.0,
+                   help="视频帧率（默认 30；轨迹 100Hz 时会自动降采样）")
+    p.add_argument("--no-preview", action="store_true",
+                   help="不打开 MuJoCo 预览窗口（配合 --video / --save 使用）")
     args = p.parse_args()
 
     if args.mode == "workspace":
@@ -686,12 +815,33 @@ def main():
     # IK 求解
     qpos_arr, qvel_arr, timestamps, errors = generate_ik_trajectory(waypoints, args.fps)
 
-    # 预览 + 保存
-    preview_trajectory(
-        qpos_arr, qvel_arr, timestamps,
-        waypoints, args.mode, args.fps,
-        auto_save=args.save,
+    size = args.half if args.mode == "square" else None
+    if args.mode == "square" and size is None:
+        size = args.radius
+    out_stem = trajectory_output_stem(
+        args.mode, args.x, args.cy, args.cz,
+        radius=args.radius, half=size,
     )
+    out_npz = out_stem + ".npz"
+    print(f"  输出文件名: {os.path.basename(out_npz)}")
+
+    if args.video is not None:
+        video_path = args.video if args.video else out_stem + ".mp4"
+        render_trajectory_video(
+            qpos_arr, qvel_arr, waypoints, video_path,
+            traj_fps=args.fps, video_fps=args.video_fps,
+        )
+
+    if args.save and args.no_preview:
+        save_trajectory_npz(
+            qpos_arr, qvel_arr, timestamps, args.mode, args.fps, out_npz
+        )
+    elif not args.no_preview:
+        preview_trajectory(
+            qpos_arr, qvel_arr, timestamps,
+            waypoints, args.mode, args.fps,
+            out_path=out_npz, auto_save=args.save,
+        )
 
 
 if __name__ == "__main__":
