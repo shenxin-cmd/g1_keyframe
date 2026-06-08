@@ -1,5 +1,5 @@
 """
-G1 批量轨迹采集主控：多形状 × 多 seed IK → 后处理 → 预览
+G1 批量轨迹采集主控：多形状 × 随机采样 → 单圈 300 帧 IK → 筛选 → obs NPZ
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ BATCH_SHAPES = [
     "random_polygon",
 ]
 
-DEFAULT_CENTER = np.array([0.27, -0.25, 1.01], dtype=np.float64)
+# center=None 时从可达域随机采样圆心
 
 
 class BatchRunner:
@@ -141,12 +141,12 @@ class BatchRunner:
             os.remove(self.lock_path)
 
     def _job_id(self, shape: str, seed: int) -> str:
-        tag = format_center_tag(self.args.center)
-        return f"{shape}_{tag}_seed{seed:03d}"
+        if self.args.center is not None:
+            return f"{shape}_{format_center_tag(self.args.center)}_seed{seed:03d}"
+        return f"{shape}_seed{seed:03d}"
 
     def _raw_path(self, shape: str, seed: int) -> str:
-        tag = format_center_tag(self.args.center)
-        fname = f"{tag}_seed{seed:03d}_L{self.args.layers}_F{self.args.frames_per_ring}.npz"
+        fname = f"seed{seed:03d}_L{self.args.layers}_F{self.args.frames_per_ring}.npz"
         return os.path.join(self.dirs["raw"], shape, fname)
 
     def _job_status(self, job_id: str) -> str | None:
@@ -173,9 +173,12 @@ class BatchRunner:
 
         self._acquire_lock()
         jobs = self._build_jobs()
+        center_desc = (
+            self.args.center.tolist() if self.args.center is not None else "随机采样"
+        )
         self.logger.info(
             "开始批量任务: %d jobs | center=%s layers=%d F=%d fps=%.0f",
-            len(jobs), self.args.center.tolist(), self.args.layers,
+            len(jobs), center_desc, self.args.layers,
             self.args.frames_per_ring, self.args.fps,
         )
 
@@ -222,6 +225,10 @@ class BatchRunner:
                     else:
                         self._emit_event("ik_start", {"job_id": job_id, "shape": shape, "seed": seed})
                         rng = np.random.default_rng(seed)
+                        center_arg = (
+                            self.args.center.copy()
+                            if self.args.center is not None else None
+                        )
                         traj = _try_generate_concentric_demo(
                             shape,
                             self.args.layers,
@@ -231,7 +238,7 @@ class BatchRunner:
                             ee, joints, ws,
                             rng,
                             refine=not self.args.no_refine,
-                            center=self.args.center.copy(),
+                            center=center_arg,
                             theta=None,
                         )
                         if traj is None:
@@ -275,11 +282,10 @@ class BatchRunner:
                     )
                     self._write_checkpoint(job_id)
                     stats["done"] += 1
+                    status = "PASS" if post["n_pass"] else "REJECT"
                     self.logger.info(
-                        "[%d/%d] %s IK %.1fs | %d pass / %d reject (of %d) | "
-                        "累计 pass=%d reject=%d failed=%d",
-                        ji + 1, len(jobs), job_id, ik_sec,
-                        post["n_pass"], post["n_reject"], post["n_clips"],
+                        "[%d/%d] %s IK %.1fs | %s | 累计 pass=%d reject=%d failed=%d",
+                        ji + 1, len(jobs), job_id, ik_sec, status,
                         stats["clips_pass"], stats["clips_reject"], stats["failed"],
                     )
 
@@ -310,12 +316,15 @@ def main():
     ap = argparse.ArgumentParser(description="G1 批量轨迹采集")
     ap.add_argument("--batch-root", default=DEFAULT_BATCH_ROOT)
     ap.add_argument("--shapes", nargs="*", default=None, help="默认 10 种形状全集")
-    ap.add_argument("--center", nargs=3, type=float, default=DEFAULT_CENTER.tolist())
-    ap.add_argument("--layers", type=int, default=3)
+    ap.add_argument("--center", nargs=3, type=float, default=None,
+                    help="固定圆心；不指定则从可达域随机采样")
+    ap.add_argument("--layers", type=int, default=1,
+                    help="每条轨迹圈数（默认 1 圈 = 300 帧）")
     ap.add_argument("--frames-per-ring", type=int, default=300)
     ap.add_argument("--fps", type=float, default=50.0)
     ap.add_argument("--seed-start", type=int, default=0)
-    ap.add_argument("--seed-count", type=int, default=50)
+    ap.add_argument("--seed-count", type=int, default=100,
+                    help="每种形状随机采样次数")
     ap.add_argument("--max-jobs", type=int, default=None, help="调试用，限制 job 数")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--force", action="store_true", help="覆盖 runner.lock")
@@ -328,7 +337,9 @@ def main():
     ap.add_argument("--max-dyaw", type=float, default=0.06)
     ap.add_argument("--max-xflip", type=int, default=40)
     args = ap.parse_args()
-    args.center = np.array(args.center, dtype=np.float64)
+    args.center = (
+        np.array(args.center, dtype=np.float64) if args.center is not None else None
+    )
 
     BatchRunner(args).run()
 

@@ -1,5 +1,5 @@
 """
-G1 批量轨迹后处理：裁切 300 帧片段 → 质量筛选 → obs NPZ
+G1 批量轨迹后处理：单圈 300 帧轨迹 → 质量筛选 → obs NPZ（无需裁切）
 """
 
 from __future__ import annotations
@@ -48,17 +48,17 @@ def format_center_tag(center: np.ndarray) -> str:
     return f"c{c[0]:.2f}_{c[1]:.2f}_{c[2]:.2f}"
 
 
-def clip_basename(
+def traj_basename(
     shape: str,
     center: np.ndarray,
     scale: float,
-    layer_idx: int,
     seed: int,
     frames: int = 300,
 ) -> str:
+    """单圈轨迹命名：形状 + 圆心 + 半径 + seed + 帧数"""
     return (
         f"{shape}_{format_center_tag(center)}_s{scale:.3f}"
-        f"_L{layer_idx}_seed{seed:03d}_F{frames}"
+        f"_seed{seed:03d}_F{frames}"
     )
 
 
@@ -156,11 +156,11 @@ def process_raw_trajectory(
     raw_path: str,
     batch_root: str = DEFAULT_BATCH_ROOT,
     thresholds: FilterThresholds | None = None,
-    save_clips_raw: bool = True,
+    save_clips_raw: bool = False,
     event_cb=None,
 ) -> dict[str, Any]:
     """
-    处理单个 raw NPZ，返回统计信息。
+    处理单个 raw NPZ（单圈 300 帧，整段筛选转 obs，无需裁切）。
     event_cb(event_type: str, payload: dict) 可选，用于写 events.jsonl。
     """
     thresholds = thresholds or FilterThresholds()
@@ -170,7 +170,6 @@ def process_raw_trajectory(
     qpos = data["qpos"]
     qvel = data["qvel"]
     waypoints = data["waypoints"]
-    segment_starts = data["segment_starts"].astype(np.int32)
     shape = str(data["shape_name"])
     center = data["center"].astype(np.float64)
     locked_branch = str(data["locked_branch"]) if "locked_branch" in data else None
@@ -180,123 +179,116 @@ def process_raw_trajectory(
     seed = int(data["seed"]) if "seed" in data else -1
     fps = float(data["fps"]) if "fps" in data else 50.0
     frames_per_ring = int(data["frames_per_ring"]) if "frames_per_ring" in data else 300
-    if "layer_scales" in data:
-        layer_scales = data["layer_scales"].astype(np.float64)
+    if "layer_scales" in data and len(data["layer_scales"]) > 0:
+        scale = float(data["layer_scales"][0])
     else:
-        sm = float(data["scale_max"]) if "scale_max" in data else 0.0
-        n_seg = max(0, len(segment_starts) - 1)
-        layer_scales = np.full(n_seg, sm, dtype=np.float64)
+        scale = float(data["scale_max"]) if "scale_max" in data else 0.0
 
-    n_pass = 0
-    n_reject = 0
+    n_frames = len(qpos)
+    base = traj_basename(shape, center, scale, seed, frames_per_ring)
+    payload_base = {
+        "shape": shape,
+        "seed": seed,
+        "scale": scale,
+        "center": center.tolist(),
+        "raw_path": raw_path,
+        "traj_name": base,
+    }
     clip_records: list[dict] = []
 
-    for si in range(len(segment_starts) - 1):
-        a, b = int(segment_starts[si]), int(segment_starts[si + 1])
-        n_frames = b - a
-        layer_idx = si + 1
-        scale = float(layer_scales[si]) if si < len(layer_scales) else float(layer_scales[-1])
-
-        base = clip_basename(shape, center, scale, layer_idx, seed, frames_per_ring)
-        payload_base = {
+    if n_frames != frames_per_ring:
+        reason = f"bad_frame_count={n_frames}!={frames_per_ring}"
+        rej_path = os.path.join(dirs["rejected"], f"{base}.reject.json")
+        with open(rej_path, "w", encoding="utf-8") as f:
+            json.dump({**payload_base, "reasons": [reason]}, f, indent=2)
+        if event_cb:
+            event_cb("traj_rejected", {**payload_base, "reasons": [reason]})
+        clip_records.append({**payload_base, "status": "rejected", "reasons": [reason]})
+        return {
+            "raw_path": raw_path,
             "shape": shape,
             "seed": seed,
-            "layer_idx": layer_idx,
-            "scale": scale,
-            "center": center.tolist(),
-            "raw_path": raw_path,
-            "clip_name": base,
+            "n_clips": 1,
+            "n_pass": 0,
+            "n_reject": 1,
+            "clips": clip_records,
         }
 
-        if n_frames != frames_per_ring:
-            reason = f"bad_frame_count={n_frames}!={frames_per_ring}"
-            rej_path = os.path.join(dirs["rejected"], f"{base}.reject.json")
-            with open(rej_path, "w", encoding="utf-8") as f:
-                json.dump({**payload_base, "reasons": [reason]}, f, indent=2)
-            n_reject += 1
-            clip_records.append({**payload_base, "status": "rejected", "reasons": [reason]})
-            if event_cb:
-                event_cb("clip_rejected", {**payload_base, "reasons": [reason]})
-            continue
+    ok, metrics, reasons = assess_clip(qpos, waypoints, locked_branch, thresholds)
+    if not ok:
+        rej_path = os.path.join(dirs["rejected"], f"{base}.reject.json")
+        with open(rej_path, "w", encoding="utf-8") as f:
+            json.dump({
+                **payload_base,
+                "metrics": metrics,
+                "thresholds": asdict(thresholds),
+                "reasons": reasons,
+            }, f, indent=2)
+        clip_records.append({**payload_base, "status": "rejected", "reasons": reasons, "metrics": metrics})
+        if event_cb:
+            event_cb("traj_rejected", {**payload_base, "reasons": reasons, "metrics": metrics})
+        return {
+            "raw_path": raw_path,
+            "shape": shape,
+            "seed": seed,
+            "n_clips": 1,
+            "n_pass": 0,
+            "n_reject": 1,
+            "clips": clip_records,
+        }
 
-        qpos_seg = qpos[a:b]
-        qvel_seg = qvel[a:b]
-        wps_seg = waypoints[a:b]
+    shape_dir_obs = os.path.join(dirs["clips_obs"], shape)
+    os.makedirs(shape_dir_obs, exist_ok=True)
+    obs_path = os.path.join(shape_dir_obs, f"{base}_obs.npz")
 
-        ok, metrics, reasons = assess_clip(qpos_seg, wps_seg, locked_branch, thresholds)
-        if not ok:
-            rej_path = os.path.join(dirs["rejected"], f"{base}.reject.json")
-            with open(rej_path, "w", encoding="utf-8") as f:
-                json.dump({
-                    **payload_base,
-                    "metrics": metrics,
-                    "thresholds": asdict(thresholds),
-                    "reasons": reasons,
-                }, f, indent=2)
-            n_reject += 1
-            clip_records.append({**payload_base, "status": "rejected", "reasons": reasons, "metrics": metrics})
-            if event_cb:
-                event_cb("clip_rejected", {**payload_base, "reasons": reasons, "metrics": metrics})
-            continue
-
+    if save_clips_raw:
         shape_dir_raw = os.path.join(dirs["clips_raw"], shape)
-        shape_dir_obs = os.path.join(dirs["clips_obs"], shape)
         os.makedirs(shape_dir_raw, exist_ok=True)
-        os.makedirs(shape_dir_obs, exist_ok=True)
-
-        raw_clip_path = os.path.join(shape_dir_raw, f"{base}_raw.npz")
-        obs_clip_path = os.path.join(shape_dir_obs, f"{base}_obs.npz")
-
-        clip_meta = dict(
-            qpos=qpos_seg,
-            qvel=qvel_seg,
-            timestamps=np.arange(n_frames, dtype=np.float32) / fps,
-            waypoints=wps_seg.astype(np.float32),
+        raw_out = os.path.join(shape_dir_raw, f"{base}_raw.npz")
+        _atomic_save_npz(
+            raw_out,
+            qpos=qpos,
+            qvel=qvel,
+            waypoints=waypoints.astype(np.float32),
             shape_name=shape,
             center=center.astype(np.float32),
             scale=np.float32(scale),
-            layer_idx=np.int32(layer_idx),
             seed=np.int32(seed),
             frames_per_ring=np.int32(frames_per_ring),
             fps=np.float32(fps),
-            locked_branch=locked_branch or "",
             source_raw=raw_path,
         )
-        if save_clips_raw:
-            _atomic_save_npz(raw_clip_path, **clip_meta)
 
-        obs = qpos_to_obs(qpos_seg, qvel_seg, fps)
-        obs.update(
-            shape_name=shape,
-            center=center.astype(np.float32),
-            scale=np.float32(scale),
-            layer_idx=np.int32(layer_idx),
-            seed=np.int32(seed),
-            waypoints=wps_seg.astype(np.float32),
-            clip_name=base,
-        )
-        _atomic_save_npz(obs_clip_path, **obs)
+    obs = qpos_to_obs(qpos, qvel, fps)
+    obs.update(
+        shape_name=shape,
+        center=center.astype(np.float32),
+        scale=np.float32(scale),
+        seed=np.int32(seed),
+        waypoints=waypoints.astype(np.float32),
+        traj_name=base,
+        source_raw=raw_path,
+    )
+    _atomic_save_npz(obs_path, **obs)
 
-        n_pass += 1
-        rec = {
-            **payload_base,
-            "status": "passed",
-            "metrics": metrics,
-            "raw_clip_path": raw_clip_path if save_clips_raw else "",
-            "obs_clip_path": obs_clip_path,
-        }
-        clip_records.append(rec)
-        if event_cb:
-            event_cb("clip_passed", rec)
-            event_cb("obs_saved", {"clip_name": base, "obs_clip_path": obs_clip_path})
+    rec = {
+        **payload_base,
+        "status": "passed",
+        "metrics": metrics,
+        "obs_clip_path": obs_path,
+    }
+    clip_records.append(rec)
+    if event_cb:
+        event_cb("traj_passed", rec)
+        event_cb("obs_saved", {"traj_name": base, "obs_clip_path": obs_path})
 
     return {
         "raw_path": raw_path,
         "shape": shape,
         "seed": seed,
-        "n_clips": len(segment_starts) - 1,
-        "n_pass": n_pass,
-        "n_reject": n_reject,
+        "n_clips": 1,
+        "n_pass": 1,
+        "n_reject": 0,
         "clips": clip_records,
     }
 

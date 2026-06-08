@@ -28,7 +28,6 @@ def inspect_clip_file(
 
     shape = str(data["shape_name"]) if "shape_name" in data else "unknown"
     scale = float(data["scale"]) if "scale" in data else 0.0
-    layer_idx = int(data["layer_idx"]) if "layer_idx" in data else 0
     seed = int(data["seed"]) if "seed" in data else -1
     center = data["center"] if "center" in data else np.zeros(3)
 
@@ -49,7 +48,7 @@ def inspect_clip_file(
     c = np.asarray(center, dtype=np.float64).reshape(3)
     title = (
         f"{shape} | center=({c[0]:.2f},{c[1]:.2f},{c[2]:.2f}) "
-        f"| scale={scale:.3f} L{layer_idx} seed={seed} | {len(qpos)}f"
+        f"| scale={scale:.3f} seed={seed} | {len(qpos)}f"
     )
     plot_ee_trajectory(
         ee_traj,
