@@ -27,6 +27,7 @@ import glob
 import os
 import time
 
+import matplotlib.pyplot as plt
 import mujoco
 import mujoco.viewer
 import numpy as np
@@ -39,6 +40,9 @@ from scipy.interpolate import interp1d
 # ══════════════════════════════════════════════
 
 MODEL_PATH = "g1/scene_g1_draggable.xml"
+# 与轨迹生成/可行域使用同一运动学模型，保证末端 FK 一致
+ROBOT_XML = "g1/g1_for_reward_inference.xml"
+EE_BODY = "right_wrist_yaw_link"
 
 # 29 个铰链关节的默认角度（与 YAML default_joint_angles 一致，顺序与 G1 XML 中关节顺序相同）
 DEFAULT_JOINT_POS = np.array([
@@ -310,6 +314,109 @@ def compute_state(data: mujoco.MjData) -> np.ndarray:
 
 
 # ══════════════════════════════════════════════
+# 右手末端轨迹记录与可视化
+# ══════════════════════════════════════════════
+
+def extract_ee_positions(model: mujoco.MjModel,
+                         qpos_arr: np.ndarray) -> np.ndarray:
+    """从 qpos 序列计算右手腕部世界坐标。"""
+    data = mujoco.MjData(model)
+    ee_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, EE_BODY)
+    pts = np.zeros((len(qpos_arr), 3), dtype=np.float64)
+    for i, q in enumerate(qpos_arr):
+        data.qpos[:] = q
+        mujoco.mj_forward(model, data)
+        pts[i] = data.xpos[ee_id].copy()
+    return pts
+
+
+def plot_ee_trajectory(
+    ee_traj: np.ndarray,
+    waypoints: np.ndarray | None = None,
+    segment_starts: np.ndarray | None = None,
+    title: str = "",
+    out_path: str | None = None,
+):
+    """
+    绘制右手末端实际轨迹，并与规划路点对比。
+    YZ 平面为形状主平面（圆/方等在该平面内生成）。
+    """
+    seg_colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
+                  "#9467bd", "#8c564b", "#e377c2", "#7f7f7f"]
+
+    fig = plt.figure(figsize=(15, 4.5))
+
+    def _plot_segments(ax, x_idx, y_idx, xlabel, ylabel, is_3d=False):
+        if segment_starts is not None and len(segment_starts) > 1:
+            for si in range(len(segment_starts) - 1):
+                a, b = int(segment_starts[si]), int(segment_starts[si + 1])
+                c = seg_colors[si % len(seg_colors)]
+                sl = ee_traj[a:b]
+                lbl = f"seg{si+1}" if si < 4 else None
+                if is_3d:
+                    ax.plot(sl[:, 0], sl[:, 1], sl[:, 2], color=c, lw=1.2,
+                            alpha=0.85, label=lbl)
+                else:
+                    ax.plot(sl[:, x_idx], sl[:, y_idx], color=c, lw=1.2,
+                            alpha=0.85, label=lbl)
+        else:
+            if is_3d:
+                ax.plot(ee_traj[:, 0], ee_traj[:, 1], ee_traj[:, 2],
+                        "b-", lw=1.2, alpha=0.85, label="actual EE")
+            else:
+                ax.plot(ee_traj[:, x_idx], ee_traj[:, y_idx],
+                        "b-", lw=1.2, alpha=0.85, label="actual EE")
+        if is_3d:
+            ax.scatter(ee_traj[0, 0], ee_traj[0, 1], ee_traj[0, 2],
+                       c="g", s=36, label="start")
+        else:
+            ax.scatter(ee_traj[0, x_idx], ee_traj[0, y_idx],
+                       c="g", s=28, zorder=5)
+        if waypoints is not None:
+            if is_3d:
+                ax.plot(waypoints[:, 0], waypoints[:, 1], waypoints[:, 2],
+                        "r--", lw=0.9, alpha=0.55, label="planned WP")
+            else:
+                ax.plot(waypoints[:, x_idx], waypoints[:, y_idx],
+                        "r--", lw=0.9, alpha=0.55, label="planned WP")
+        ax.set_xlabel(xlabel)
+        if not is_3d:
+            ax.set_ylabel(ylabel)
+            ax.set_aspect("equal", adjustable="datalim")
+            ax.grid(True, alpha=0.3)
+        else:
+            ax.set_ylabel("Y (m)")
+            ax.set_zlabel("Z (m)")
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(fontsize=7, loc="best")
+
+    ax3d = fig.add_subplot(131, projection="3d")
+    _plot_segments(ax3d, 0, 1, "X (m)", "Y (m)", is_3d=True)
+    ax3d.set_title("3D EE path")
+    ax3d.view_init(elev=20, azim=-60)
+
+    ax_yz = fig.add_subplot(132)
+    _plot_segments(ax_yz, 1, 2, "Y (m)", "Z (m)")
+    ax_yz.set_title("YZ (shape plane)")
+
+    ax_xy = fig.add_subplot(133)
+    _plot_segments(ax_xy, 0, 1, "X (m)", "Y (m)")
+    ax_xy.set_title("XY (top view)")
+
+    if title:
+        fig.suptitle(title, fontsize=11)
+    fig.tight_layout()
+
+    if out_path:
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        print(f"末端轨迹图已保存 → {out_path}")
+    if os.environ.get("MPLBACKEND", "").lower() != "agg":
+        plt.show(block=True)
+    plt.close(fig)
+
+
+# ══════════════════════════════════════════════
 # 主程序
 # ══════════════════════════════════════════════
 
@@ -325,12 +432,22 @@ def main():
                         help="不打开 MuJoCo 窗口（仅计算观测）")
     parser.add_argument("--out-dir",   type=str,   default="recordings",
                         help="观测 NPZ 输出目录")
+    parser.add_argument("--no-plot", action="store_true", default=False,
+                        help="不绘制右手末端轨迹图（默认回放后自动绘制）")
+    parser.add_argument("--plot-out", type=str, default=None,
+                        help="末端轨迹图保存路径（默认与轨迹同名 _ee_traj.png）")
     args = parser.parse_args()
+    do_plot_ee = not args.no_plot
 
     # ── 选择轨迹文件 ──
     traj_path = args.traj
     if traj_path is None:
-        files = sorted(glob.glob(os.path.join("recordings", "g1_traj_*.npz")))
+        patterns = [
+            os.path.join("recordings", "g1_concentric_*.npz"),
+            os.path.join("recordings", "g1_multi_*.npz"),
+            os.path.join("recordings", "g1_traj_*.npz"),
+        ]
+        files = sorted({f for pat in patterns for f in glob.glob(pat)})
         if not files:
             print("录制目录中未找到轨迹文件，请先用 g1_recorder.py 录制。")
             return
@@ -347,11 +464,24 @@ def main():
     qpos_raw  = traj["qpos"].astype(np.float32)    # (N, 36)
     qvel_raw  = traj["qvel"].astype(np.float32)    # (N, 35)
     t_raw     = traj["timestamps"].astype(np.float32)
-    record_dt = float(traj.get("record_dt", 0.01))
-    record_fps = 1.0 / record_dt
+    if "record_dt" in traj:
+        record_dt = float(traj["record_dt"])
+        record_fps = 1.0 / record_dt
+    elif "fps" in traj:
+        record_fps = float(traj["fps"])
+        record_dt = 1.0 / record_fps
+    else:
+        record_dt = 0.01
+        record_fps = 100.0
 
     N_raw = len(qpos_raw)
     print(f"  原始帧数: {N_raw}  |  录制帧率: {record_fps:.1f} Hz  |  时长: {t_raw[-1]-t_raw[0]:.2f}s")
+
+    waypoints = traj["waypoints"].astype(np.float64) if "waypoints" in traj else None
+    segment_starts = (
+        traj["segment_starts"].astype(np.int32) if "segment_starts" in traj else None
+    )
+    shape_name = str(traj["shape_name"]) if "shape_name" in traj else None
 
     # ── 重采样 ──
     if abs(args.fps - record_fps) < 0.5:
@@ -371,6 +501,10 @@ def main():
     data  = mujoco.MjData(model)
     mujoco.mj_forward(model, data)
 
+    # 末端轨迹记录用与 traj_gen 相同的运动学链
+    ee_model = mujoco.MjModel.from_xml_path(ROBOT_XML)
+    ee_data = mujoco.MjData(ee_model)
+
     priv_computer = PrivilegedStateComputer(model, dt=PRIV_STATE_DT)
 
     # 预计算 privileged_state 维度
@@ -387,9 +521,17 @@ def main():
     out_state  = np.zeros((N, 64),     dtype=np.float32)
     out_action = np.zeros((N, 29),     dtype=np.float32)  # 全零
     out_priv   = np.zeros((N, D_priv), dtype=np.float32)
+    ee_id = mujoco.mj_name2id(ee_model, mujoco.mjtObj.mjOBJ_BODY, EE_BODY)
+    ee_record = np.zeros((N, 3), dtype=np.float64) if do_plot_ee else None
 
     # ── 帧间隔 ──
     frame_dt = 1.0 / args.fps
+
+    def _record_frame(i: int):
+        if ee_record is not None:
+            ee_data.qpos[:] = qpos_play[i]
+            mujoco.mj_forward(ee_model, ee_data)
+            ee_record[i] = ee_data.xpos[ee_id].copy()
 
     # ── 带或不带 viewer 的回放 ──
     def _run_headless():
@@ -401,6 +543,7 @@ def main():
             mujoco.mj_forward(model, data)
             out_state[i]  = compute_state(data)
             out_priv[i]   = priv_computer.compute(data)
+            _record_frame(i)
             if (i+1) % 100 == 0 or i == N-1:
                 print(f"  {i+1}/{N} 帧处理完成", end="\r")
         print()
@@ -425,6 +568,7 @@ def main():
                     if loop_count == 1:
                         out_state[i] = compute_state(data)
                         out_priv[i]  = priv_computer.compute(data)
+                        _record_frame(i)
 
                     viewer.sync()
 
@@ -434,7 +578,7 @@ def main():
                         time.sleep(sleep_t)
 
                 if not args.loop:
-                    print("回放完成，按 ESC 退出")
+                    print("回放完成，关闭 MuJoCo 窗口后将显示末端轨迹图")
                     while viewer.is_running():
                         viewer.sync()
                         time.sleep(0.02)
@@ -444,6 +588,22 @@ def main():
         _run_headless()
     else:
         _run_with_viewer()
+
+    if do_plot_ee and ee_record is not None:
+        plot_title = os.path.basename(traj_path)
+        if shape_name:
+            plot_title += f"  |  shape={shape_name}"
+        plot_out = args.plot_out
+        if plot_out is None:
+            base = os.path.splitext(traj_path)[0]
+            plot_out = f"{base}_ee_traj.png"
+        plot_ee_trajectory(
+            ee_record,
+            waypoints=waypoints,
+            segment_starts=segment_starts,
+            title=plot_title,
+            out_path=plot_out,
+        )
 
     # ── 保存观测 NPZ ──
     os.makedirs(args.out_dir, exist_ok=True)

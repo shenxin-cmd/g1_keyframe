@@ -26,21 +26,36 @@ import mujoco
 import mujoco.viewer
 import numpy as np
 
+from g1_arm_posture import (
+    ELBOW_BRANCH_AUTO,
+    ELBOW_BRANCH_INWARD,
+    ELBOW_BRANCH_OUTWARD,
+    NATURAL_Q4_REF,
+    is_allowed_q4,
+    pick_locked_branch_from_candidates,
+    q4_branch_stable_with_anchor,
+    resolve_branch_mode,
+)
 from g1_multi_shapes import SHAPE_NAMES, make_shape_local, make_shape_waypoints
 from g1_right_hand_workspace import (
+    CENTER_SAMPLE_INSET,
     DEFAULT_FRONT_X_MAX,
     DEFAULT_FRONT_X_MIN,
     ROBOT_XML,
     WS_CACHE_PATH,
     ReachableWorkspace,
-    _EE_COLLISION_BODY_NAMES,
+    _RIGHT_ARM_COLLISION_BODY_NAMES,
     _OBSTACLE_BODY_NAMES_MINIMAL,
     _build_addr_table,
     _build_collision_id_sets,
     _has_penetration,
     _reset_to_home,
     build_reachable_workspace,
+    envelope_margins_at,
+    inset_bounds,
     load_workspace_cache,
+    mask_points_in_box,
+    sample_center_from_cloud,
 )
 
 os.makedirs("recordings", exist_ok=True)
@@ -70,12 +85,25 @@ DEFAULT_FRAMES_PER_SHAPE = 250
 DEFAULT_TRANSITION_FRAMES = 25
 DEFAULT_NUM_SHAPES = 8
 
-# 大/小形状占所在八分区可用半径的比例（相对 scale_fit，保证视觉上有明显大小差）
-SCALE_LARGE_FRAC = (0.78, 0.95)
-SCALE_SMALL_FRAC = (0.22, 0.40)
+# 大/小形状在「中心处最大可用 scale」上的采样比例区间
+SCALE_LARGE_FRAC_OF_MAX = (0.62, 0.92)
+SCALE_SMALL_FRAC_OF_MAX = (0.22, 0.48)
+SCALE_SHRINK_STEP = 0.01
+SCALE_MIN = 0.025
 WS_PROXIMITY = 0.038
-IK_ERR_THRESH = WS_PROXIMITY
+IK_ERR_THRESH = 0.045
+IK_POLISH_TOL = 0.014
 IK_MIN_OK_RATIO = 0.96
+MAX_COL_RATIO = 0.0
+# 抛光相对锚点的最大关节偏移（严格，防止肘部翻支）
+IK_MAX_ANCHOR_DELTA = 0.10
+IK_MAX_SEED_DELTA = 0.12
+# 肩 roll 是解支/深度(X) 敏感轴：路径与抛光均强约束
+IK_MAX_ROLL_STEP = 0.06
+IK_MAX_ROLL_ANCHOR_SLACK = 0.05
+IK_MAX_DEPTH_X_SLACK = 0.012
+Q4_ROLL_IDX = 1
+JOINT_PATH_SMOOTH_PASSES = 0
 
 SHARP_SHAPES = frozenset({
     "star", "pentagon", "diamond", "heart", "random_polygon", "random_spline",
@@ -134,10 +162,69 @@ class IKSolver4DOF:
         final_err = float(np.linalg.norm(target_pos - self.data.xpos[self.ee_id]))
         return final_err, False
 
+    def solve_constrained(
+        self,
+        target_pos: np.ndarray,
+        q4_anchor: np.ndarray,
+        q4_seed: np.ndarray | None = None,
+        max_iter: int = 100,
+        tol: float = IK_POLISH_TOL,
+        max_delta: float = IK_MAX_ANCHOR_DELTA,
+        lam_base: float = 1e-3,
+        hold_depth_x: bool = False,
+    ) -> tuple[float, np.ndarray]:
+        """DLS 抛光：以锚点解支为基准，上一帧为初值，小步逼近目标。"""
+        anchor = np.asarray(q4_anchor, dtype=np.float64).reshape(4)
+        if q4_seed is not None:
+            self.seed_joints(q4_seed)
+        else:
+            self.seed_joints(anchor)
+        best_q = self._get_q().copy()
+        best_err = float("inf")
+        target_pos = np.asarray(target_pos, dtype=np.float64).reshape(3)
+        for _ in range(max_iter):
+            self._lock_wrist()
+            mujoco.mj_forward(self.model, self.data)
+            ee_pos = self.data.xpos[self.ee_id].copy()
+            err_vec = target_pos - ee_pos
+            if hold_depth_x:
+                err_vec[0] = 0.0
+            e_norm = float(np.linalg.norm(err_vec))
+            q_now = self._get_q()
+            if e_norm < best_err:
+                best_err = e_norm
+                best_q = q_now.copy()
+            if e_norm < tol:
+                return e_norm, q_now
+            lam = lam_base + 5e-3 * e_norm
+            mujoco.mj_jacBody(self.model, self.data, self._jacp, None, self.ee_id)
+            J = self._jacp[:, self.dof_addrs]
+            dq = J.T @ np.linalg.solve(J @ J.T + lam * np.eye(3), err_vec)
+            dq = np.clip(dq, -0.05, 0.05)
+            dq[Q4_ROLL_IDX] = np.clip(dq[Q4_ROLL_IDX], -0.035, 0.035)
+            q_new = q_now + dq
+            q_new = anchor + np.clip(q_new - anchor, -max_delta, max_delta)
+            q_new[Q4_ROLL_IDX] = anchor[Q4_ROLL_IDX] + np.clip(
+                q_new[Q4_ROLL_IDX] - anchor[Q4_ROLL_IDX],
+                -IK_MAX_ROLL_STEP, IK_MAX_ROLL_STEP,
+            )
+            self._set_q(q_new)
+        self.seed_joints(best_q)
+        self._lock_wrist()
+        mujoco.mj_forward(self.model, self.data)
+        return best_err, best_q
+
 
 # ══════════════════════════════════════════════
 # 分层规划
 # ══════════════════════════════════════════════
+
+def _binary_flags(n: int, rng: np.random.Generator) -> np.ndarray:
+    flags = np.zeros(n, dtype=bool)
+    flags[: n // 2] = True
+    rng.shuffle(flags)
+    return flags
+
 
 def region_bounds(ws: ReachableWorkspace, left: bool, up: bool, front: bool):
     lo = ws.lo.copy()
@@ -157,14 +244,19 @@ def region_bounds(ws: ReachableWorkspace, left: bool, up: bool, front: bool):
     return lo, hi
 
 
-def _binary_flags(n: int, rng: np.random.Generator) -> np.ndarray:
-    flags = np.zeros(n, dtype=bool)
-    flags[: n // 2] = True
-    rng.shuffle(flags)
-    return flags
+def _region_mask(ee_cloud, ws, left, up, front):
+    lo_r, hi_r = region_bounds(ws, left, up, front)
+    eps = 1e-6
+    return (
+        (ee_cloud[:, 0] >= lo_r[0] - eps) & (ee_cloud[:, 0] <= hi_r[0] + eps) &
+        (ee_cloud[:, 1] >= lo_r[1] - eps) & (ee_cloud[:, 1] <= hi_r[1] + eps) &
+        (ee_cloud[:, 2] >= lo_r[2] - eps) & (ee_cloud[:, 2] <= hi_r[2] + eps)
+    )
 
 
-def plan_shapes_stratified(num_shapes: int, rng: np.random.Generator) -> list[dict]:
+def plan_shapes_stratified(num_shapes: int, rng: np.random.Generator,
+                           ws: ReachableWorkspace) -> list[dict]:
+    """左/右、上/下、前/后、大/小各约 N/2 分层。"""
     left = _binary_flags(num_shapes, rng)
     up = _binary_flags(num_shapes, rng)
     front = _binary_flags(num_shapes, rng)
@@ -184,46 +276,21 @@ def plan_shapes_stratified(num_shapes: int, rng: np.random.Generator) -> list[di
     return plans
 
 
-def _region_mask(ee_cloud, ws, left, up, front):
-    lo_r, hi_r = region_bounds(ws, left, up, front)
-    eps = 1e-6
-    return (
-        (ee_cloud[:, 0] >= lo_r[0] - eps) & (ee_cloud[:, 0] <= hi_r[0] + eps) &
-        (ee_cloud[:, 1] >= lo_r[1] - eps) & (ee_cloud[:, 1] <= hi_r[1] + eps) &
-        (ee_cloud[:, 2] >= lo_r[2] - eps) & (ee_cloud[:, 2] <= hi_r[2] + eps)
-    )
-
-
-def _region_margin(pts: np.ndarray, lo_r: np.ndarray, hi_r: np.ndarray) -> np.ndarray:
-    """每个点到八分区边界的最近余量（越大越能画大形状）。"""
-    return np.minimum.reduce([
-        pts[:, 0] - lo_r[0], hi_r[0] - pts[:, 0],
-        pts[:, 1] - lo_r[1], hi_r[1] - pts[:, 1],
-        pts[:, 2] - lo_r[2], hi_r[2] - pts[:, 2],
-    ])
-
-
-def pick_center_in_region(ee_cloud, ws, plan, rng):
-    mask = _region_mask(ee_cloud, ws, plan["left"], plan["up"], plan["front"])
-    pts = ee_cloud[mask]
+def pick_center_in_region(ee_cloud, ws, plan, rng,
+                          inset: float = CENTER_SAMPLE_INSET):
     lo_r, hi_r = region_bounds(ws, plan["left"], plan["up"], plan["front"])
-    if len(pts) < 5:
-        target = (lo_r + hi_r) * 0.5
-        idx = int(np.argmin(np.linalg.norm(ee_cloud - target, axis=1)))
-        return ee_cloud[idx].copy()
-    if plan["large"]:
-        margins = _region_margin(pts, lo_r, hi_r)
-        thresh = float(np.percentile(margins, 65))
-        good = pts[margins >= thresh]
-        if len(good) < 3:
-            good = pts
-        return good[rng.integers(0, len(good))].copy()
-    margins = _region_margin(pts, lo_r, hi_r)
-    thresh = float(np.percentile(margins, 40))
-    good = pts[margins <= thresh]
-    if len(good) < 3:
-        good = pts
-    return good[rng.integers(0, len(good))].copy()
+    lo_r, hi_r = inset_bounds(lo_r, hi_r, inset)
+    mask = mask_points_in_box(ee_cloud, lo_r, hi_r)
+    pool = ee_cloud[mask]
+    if len(pool) < 8:
+        return sample_center_from_cloud(ee_cloud, ws.lo, ws.hi, rng, inset)
+    target = (lo_r + hi_r) * 0.5
+    target += rng.uniform(-0.03, 0.03, size=3)
+    d = np.linalg.norm(pool - target, axis=1)
+    k = min(48, len(pool))
+    cands = np.argpartition(d, k - 1)[:k]
+    best = int(cands[np.argmin(d[cands])])
+    return pool[best].copy()
 
 
 def _yz_extents_at_theta(local_yz, theta):
@@ -234,70 +301,60 @@ def _yz_extents_at_theta(local_yz, theta):
     return float(dy.max()), float(dz.max())
 
 
-def compute_safe_scale(center, theta, shape_name, plan, ws, rng, margin=0.025):
+def compute_safe_scale(center, theta, shape_name, plan, ws, rng, margin=0.012):
     """
-    在八分区内先算最大可用 scale_fit，再按大/小分层取不同比例。
-    避免绝对米数上限被 scale_fit 压扁导致所有形状一样大。
+    用 x 切片 yz 边界估算中心处最大 scale，再在大/小比例区间内随机采样。
     """
-    lo, hi = region_bounds(ws, plan["left"], plan["up"], plan["front"])
     local = make_shape_local(shape_name, 48, rng)
     ext_y, ext_z = _yz_extents_at_theta(local, theta)
     ext_y = max(ext_y, 1e-6)
     ext_z = max(ext_z, 1e-6)
-    cy, cz = float(center[1]), float(center[2])
-    scale_y = min(cy - lo[1] - margin, hi[1] - cy - margin) / ext_y
-    scale_z = min(cz - lo[2] - margin, hi[2] - cz - margin) / ext_z
-    scale_fit = min(scale_y, scale_z)
-    if scale_fit < 0.025:
-        scale_fit = 0.025
-
-    frac_lo, frac_hi = SCALE_LARGE_FRAC if plan["large"] else SCALE_SMALL_FRAC
+    if ws.envelope is not None:
+        my, mz = envelope_margins_at(ws.envelope, center, margin=margin)
+    else:
+        cy, cz = float(center[1]), float(center[2])
+        my = min(cy - ws.lo[1], ws.hi[1] - cy) - margin
+        mz = min(cz - ws.lo[2], ws.hi[2] - cz) - margin
+    scale_max = min(my / ext_y, mz / ext_z)
+    scale_max = float(max(SCALE_MIN, scale_max))
+    frac_lo, frac_hi = (SCALE_LARGE_FRAC_OF_MAX if plan["large"]
+                        else SCALE_SMALL_FRAC_OF_MAX)
     frac = float(rng.uniform(frac_lo, frac_hi))
-    scale = scale_fit * frac
-    return float(max(0.02, min(scale, scale_fit * 0.96))), scale_fit, frac
+    scale = float(max(SCALE_MIN, min(frac * scale_max, scale_max * 0.98)))
+    return scale, scale_max, frac
 
 
-def _scale_floor_for_plan(plan: dict, scale_fit: float) -> float:
-    """拟合可行域时允许缩小的下限，避免大形状被压成与小形状同尺寸。"""
-    frac_lo = SCALE_LARGE_FRAC[0] if plan["large"] else SCALE_SMALL_FRAC[0]
-    return float(max(0.02, scale_fit * frac_lo * 0.82))
-
-
-def waypoints_near_workspace(waypoints, ee_cloud, max_dist=WS_PROXIMITY):
-    diff = waypoints[:, None, :] - ee_cloud[None, :, :]
-    dmin = np.linalg.norm(diff, axis=2).min(axis=1)
-    return bool(dmin.max() <= max_dist), float(dmin.max())
+def waypoints_in_reachable_box(waypoints, ws: ReachableWorkspace, margin=0.006):
+    lo = ws.lo - margin
+    hi = ws.hi + margin
+    return bool((waypoints >= lo).all() and (waypoints <= hi).all())
 
 
 def fit_shape_waypoints_to_workspace(shape, center, scale, theta,
                                      frames_per_shape, ee_cloud, rng,
-                                     scale_floor: float = 0.02,
-                                     is_large: bool = False,
-                                     max_attempts: int = 10):
+                                     ws: ReachableWorkspace,
+                                     scale_max: float | None = None,
+                                     min_scale: float = SCALE_MIN):
+    """边界采样为主；若仍略超可行域则每次减 1cm。"""
     scale = float(scale)
-    initial = scale
-    floor = float(scale_floor)
-    # 大形状最多缩小 30%，小形状最多缩小 45%，避免全部挤成同一尺寸
-    shrink_floor = initial * (0.70 if is_large else 0.55)
-    floor = max(floor, shrink_floor)
-    prox = WS_PROXIMITY * (1.12 if is_large else 1.0)
+    floor = float(min_scale)
+    if scale_max is not None:
+        floor = max(floor, scale_max * SCALE_SMALL_FRAC_OF_MAX[0] * 0.85)
+    prox = WS_PROXIMITY * 1.06
     last_dmax = 0.0
-    for _ in range(max_attempts):
+    while scale >= floor - 1e-9:
         shape_wps = make_shape_waypoints(
             shape, center, scale, theta, N=frames_per_shape, rng=rng
         )
         diff = shape_wps[:, None, :] - ee_cloud[None, :, :]
         dmin = np.linalg.norm(diff, axis=2).min(axis=1)
         last_dmax = float(dmin.max())
-        if last_dmax <= prox:
+        if last_dmax <= prox and waypoints_in_reachable_box(shape_wps, ws):
             return shape_wps, scale
-        if last_dmax > 1e-6:
-            scale *= min(0.92, 0.97 * prox / last_dmax)
-        else:
-            scale *= 0.90
-        scale = max(scale, floor)
+        scale -= SCALE_SHRINK_STEP
     raise RuntimeError(
-        f"路点超出可行域 (max_dist={last_dmax:.3f}m > {prox:.3f}m)"
+        f"路点超出可行域 (max_dist={last_dmax:.3f}m > {prox:.3f}m, "
+        f"scale<{floor:.3f}m)"
     )
 
 
@@ -317,21 +374,113 @@ def blend_waypoints_to_workspace(waypoints, ee_cloud, alpha):
 # IK 轨迹求解
 # ══════════════════════════════════════════════
 
-def assign_workspace_joint_path(waypoints, ee_cloud, joint_configs, k_neighbors=20):
+def _q4_has_arm_collision(solver, model, data, q4, arm_ids, obstacle_ids):
+    solver.seed_joints(np.asarray(q4, dtype=np.float64))
+    solver._lock_wrist()
+    mujoco.mj_forward(model, data)
+    return _has_penetration(model, data, arm_ids, obstacle_ids)
+
+
+def assign_workspace_joint_path(
+    waypoints, ee_cloud, joint_configs, k_neighbors=20,
+    solver=None, model=None, data=None, arm_ids=None, obstacle_ids=None,
+    prox=WS_PROXIMITY, elbow_branch_mode=ELBOW_BRANCH_AUTO,
+    locked_branch: str | None = None,
+):
     n_wp = len(waypoints)
     k_neighbors = min(k_neighbors, len(ee_cloud))
     idx = np.zeros(n_wp, dtype=int)
-    idx[0] = int(np.argmin(np.linalg.norm(ee_cloud - waypoints[0], axis=1)))
+    use_col = all(x is not None for x in (
+        solver, model, data, arm_ids, obstacle_ids,
+    ))
+    addr = None
+    if model is not None:
+        addr = _build_addr_table(model, ACTIVE_JOINTS + list(LOCKED_JOINTS.keys()))
+
+    def _cand_order_for(wp, prev_idx=None):
+        dist_i = np.linalg.norm(ee_cloud - wp, axis=1)
+        near = np.where(dist_i <= prox * 1.15)[0]
+        if len(near) < 3:
+            order = np.argsort(dist_i)
+            near = order[:max(k_neighbors, 48)]
+        if prev_idx is None:
+            return near[np.argsort(dist_i[near])]
+        prev_q = joint_configs[prev_idx]
+        dj = np.linalg.norm(joint_configs[near] - prev_q, axis=1)
+        d_roll = np.abs(joint_configs[near, Q4_ROLL_IDX] - prev_q[Q4_ROLL_IDX])
+        d_x = np.abs(ee_cloud[near, 0] - wp[0])
+        # 深度(X) 一致 > roll 连续 > 关节距离 > 末端距离
+        return near[np.lexsort((dist_i[near], dj, d_roll, d_x))]
+
+    def _pick_for_waypoint(wp, prev_idx=None, branch=None, roll_hint: float | None = None):
+        dist_i = np.linalg.norm(ee_cloud - wp, axis=1)
+        cand_order = _cand_order_for(wp, prev_idx)
+
+        def _pick_best(candidates, max_dx: float | None = None):
+            valid = []
+            for c in candidates:
+                q4 = joint_configs[c]
+                if not is_allowed_q4(q4, branch, model, data, addr):
+                    continue
+                if max_dx is not None and abs(float(ee_cloud[c, 0] - wp[0])) > max_dx:
+                    continue
+                if use_col and _q4_has_arm_collision(
+                    solver, model, data, q4, arm_ids, obstacle_ids,
+                ):
+                    continue
+                valid.append(int(c))
+            if not valid:
+                return None
+            if len(valid) == 1:
+                return valid[0]
+            prev_q = (
+                joint_configs[prev_idx] if prev_idx is not None else None
+            )
+            scored = []
+            for c in valid[:24]:
+                d_j = (
+                    float(np.linalg.norm(joint_configs[c] - prev_q))
+                    if prev_q is not None else 0.0
+                )
+                d_roll = 0.0
+                if prev_q is not None:
+                    d_roll = abs(float(joint_configs[c, Q4_ROLL_IDX] - prev_q[Q4_ROLL_IDX]))
+                elif roll_hint is not None:
+                    d_roll = abs(float(joint_configs[c, Q4_ROLL_IDX] - roll_hint))
+                d_nat = abs(float(joint_configs[c, Q4_ROLL_IDX] - NATURAL_Q4_REF[1]))
+                roll_pen = 1 if d_roll > IK_MAX_ROLL_STEP else 0
+                d_x = abs(float(ee_cloud[c, 0] - wp[0]))
+                scored.append((roll_pen, d_roll, d_x, d_j, d_nat, float(dist_i[c]), c))
+            scored.sort(key=lambda x: (x[0], x[1], x[2], x[3], x[4], x[5]))
+            return scored[0][6]
+
+        dx_limits = [IK_MAX_DEPTH_X_SLACK, IK_MAX_DEPTH_X_SLACK * 2.5, None]
+        for dx_lim in dx_limits:
+            picked = _pick_best(cand_order, max_dx=dx_lim)
+            if picked is not None:
+                return picked
+            picked = _pick_best(np.argsort(dist_i), max_dx=dx_lim)
+            if picked is not None:
+                return picked
+        raise RuntimeError("无满足姿态/碰撞约束的关节配置")
+
+    if locked_branch is None:
+        c0 = _cand_order_for(waypoints[0])
+        locked_branch = pick_locked_branch_from_candidates(
+            joint_configs, c0, elbow_branch_mode, model, data, addr,
+        )
+        if locked_branch is None:
+            raise RuntimeError("首点无法确定肘部折向（可能均为向上翻折）")
+    idx[0] = _pick_for_waypoint(waypoints[0], branch=locked_branch)
+    roll_hint = float(joint_configs[idx[0], Q4_ROLL_IDX])
     for i in range(1, n_wp):
-        dist_i = np.linalg.norm(ee_cloud - waypoints[i], axis=1)
-        cands = np.argpartition(dist_i, k_neighbors)[:k_neighbors]
-        prev_q = joint_configs[idx[i - 1]]
-        dj = np.linalg.norm(joint_configs[cands] - prev_q, axis=1)
-        idx[i] = int(cands[np.argmin(dj)])
-    return idx
+        idx[i] = _pick_for_waypoint(
+            waypoints[i], idx[i - 1], locked_branch, roll_hint=roll_hint,
+        )
+    return idx, locked_branch
 
 
-def _smooth_joint_path_4d(q4, passes=2):
+def _smooth_joint_path_4d(q4, passes=2, closed: bool = True):
     q = np.asarray(q4, dtype=np.float64).copy()
     n = len(q)
     if n < 3:
@@ -339,14 +488,54 @@ def _smooth_joint_path_4d(q4, passes=2):
     for _ in range(passes):
         q_new = q.copy()
         for i in range(n):
-            im, ip = (i - 1) % n, (i + 1) % n
+            if closed:
+                im, ip = (i - 1) % n, (i + 1) % n
+            else:
+                im, ip = max(0, i - 1), min(n - 1, i + 1)
             q_new[i] = 0.22 * q[im] + 0.56 * q[i] + 0.22 * q[ip]
+            q_new[i, Q4_ROLL_IDX] = q[i, Q4_ROLL_IDX]
         q = q_new
     return q
 
 
+def _qpos_from_q4_seed(solver, model, data, q4: np.ndarray) -> np.ndarray:
+    solver.seed_joints(np.asarray(q4, dtype=np.float64))
+    solver._lock_wrist()
+    mujoco.mj_forward(model, data)
+    return data.qpos.copy()
+
+
+def _clamp_q4_to_anchor(q4, anchor, max_delta: float) -> np.ndarray:
+    q4 = np.asarray(q4, dtype=np.float64).reshape(4)
+    anchor = np.asarray(anchor, dtype=np.float64).reshape(4)
+    return anchor + np.clip(q4 - anchor, -max_delta, max_delta)
+
+
 def _ee_error(model, data, ee_id, target):
     return float(np.linalg.norm(target - data.xpos[ee_id]))
+
+
+def _q4_from_qpos(data, addr) -> np.ndarray:
+    return np.array(
+        [float(data.qpos[addr[n][0]]) for n in ACTIVE_JOINTS],
+        dtype=np.float64,
+    )
+
+
+def _enforce_posture_qpos(qpos, q4_fallback, locked_branch,
+                          solver, model, data, addr, ee_id, wp):
+    """IK 抛光后若折向/伸直约束被破坏，回退到可行域关节角。"""
+    data.qpos[:] = qpos
+    mujoco.mj_forward(model, data)
+    if locked_branch is None:
+        return qpos, _ee_error(model, data, ee_id, wp)
+    q4 = _q4_from_qpos(data, addr)
+    if is_allowed_q4(q4, locked_branch, model, data, addr):
+        return qpos, _ee_error(model, data, ee_id, wp)
+    solver.seed_joints(np.asarray(q4_fallback, dtype=np.float64))
+    solver._lock_wrist()
+    mujoco.mj_forward(model, data)
+    return data.qpos.copy(), _ee_error(model, data, ee_id, wp)
 
 
 def _qpos_vel_from_sequence(qpos_arr, fps, nv):
@@ -361,54 +550,181 @@ def _qpos_vel_from_sequence(qpos_arr, fps, nv):
     return qvel_arr, timestamps
 
 
+def _solve_frame_with_collision_fallback(
+    wp, tgt, snap, q4_ws_i, q4_smooth_i,
+    solver, model, data, ee_id, arm_ids, obstacle_ids,
+    max_iter, err_thresh, polish_thresh, locked_branch=None,
+):
+    """优先用可行域关节角（已验证无穿透），仅在 IK 后仍无碰撞时才采纳。"""
+    addr = _build_addr_table(model, ACTIVE_JOINTS + list(LOCKED_JOINTS.keys()))
+    if not is_allowed_q4(q4_ws_i, locked_branch, model, data, addr):
+        raise RuntimeError("路点关节解违反肘部姿态约束")
+    seeds = [q4_ws_i]
+    if (not _q4_has_arm_collision(
+        solver, model, data, q4_smooth_i, arm_ids, obstacle_ids,
+    ) and is_allowed_q4(q4_smooth_i, locked_branch, model, data, addr)):
+        seeds.insert(0, q4_smooth_i)
+    best_qpos = None
+    best_err = float("inf")
+    best_col = True
+    for si, q4_seed in enumerate(seeds):
+        solver.seed_joints(q4_seed)
+        solver._lock_wrist()
+        mujoco.mj_forward(model, data)
+        err = _ee_error(model, data, ee_id, wp)
+        col = _has_penetration(model, data, arm_ids, obstacle_ids)
+        if not col and err <= err_thresh:
+            qpos, err = _enforce_posture_qpos(
+                data.qpos.copy(), q4_ws_i, locked_branch,
+                solver, model, data, addr, ee_id, wp,
+            )
+            return qpos, err, False
+        if err > polish_thresh * 1.8 and not col:
+            solve_tgt = snap
+            iters = max(30, max_iter // 3)
+            err_try, _ = solver.solve(solve_tgt, max_iter=iters)
+            err_try = _ee_error(model, data, ee_id, wp)
+            solver._lock_wrist()
+            mujoco.mj_forward(model, data)
+            if not _has_penetration(model, data, arm_ids, obstacle_ids):
+                err = err_try
+            else:
+                solver.seed_joints(q4_seed)
+                solver._lock_wrist()
+                mujoco.mj_forward(model, data)
+                err = _ee_error(model, data, ee_id, wp)
+        solver._lock_wrist()
+        mujoco.mj_forward(model, data)
+        col = _has_penetration(model, data, arm_ids, obstacle_ids)
+        if not col and (best_col or err < best_err):
+            best_qpos = data.qpos.copy()
+            best_err = err
+            best_col = False
+        if not col and err <= err_thresh:
+            qpos, err = _enforce_posture_qpos(
+                data.qpos.copy(), q4_ws_i, locked_branch,
+                solver, model, data, addr, ee_id, wp,
+            )
+            return qpos, err, False
+    if best_qpos is not None:
+        qpos, err = _enforce_posture_qpos(
+            best_qpos, q4_ws_i, locked_branch,
+            solver, model, data, addr, ee_id, wp,
+        )
+        return qpos, err, best_col
+    qpos, err = _enforce_posture_qpos(
+        data.qpos.copy(), q4_ws_i, locked_branch,
+        solver, model, data, addr, ee_id, wp,
+    )
+    return qpos, err, col
+
+
 def solve_waypoints_ik(
     waypoints, ee_cloud, joint_configs, fps,
     solver, model, data, arm_ids, obstacle_ids,
     max_iter=120, err_thresh=IK_ERR_THRESH,
     show_progress=False, ik_targets=None,
+    elbow_branch_mode=ELBOW_BRANCH_AUTO,
+    locked_branch: str | None = None,
+    closed_path: bool = True,
+    smooth_passes: int = JOINT_PATH_SMOOTH_PASSES,
 ):
-    if ik_targets is None:
-        ik_targets = waypoints
-    path_idx = assign_workspace_joint_path(waypoints, ee_cloud, joint_configs)
-    q4_smooth = _smooth_joint_path_4d(joint_configs[path_idx], passes=3)
+    """
+    可行域选解（roll 连续优先）→ 轻量关节平滑 → 锚点约束 DLS 抛光。
+    抛光时限制肩 roll 步长，避免同支解内 X 锯齿。
+    """
+    targets = waypoints if ik_targets is None else ik_targets
+    path_idx, locked_branch = assign_workspace_joint_path(
+        waypoints, ee_cloud, joint_configs,
+        solver=solver, model=model, data=data,
+        arm_ids=arm_ids, obstacle_ids=obstacle_ids,
+        elbow_branch_mode=elbow_branch_mode,
+        locked_branch=locked_branch,
+    )
+    q4_anchors = joint_configs[path_idx]
+    q4_path = _smooth_joint_path_4d(
+        q4_anchors, passes=smooth_passes, closed=closed_path,
+    )
+    hold_depth_x = float(np.ptp(waypoints[:, 0])) < 0.006
     ee_id = solver.ee_id
+    addr = _build_addr_table(model, ACTIVE_JOINTS + list(LOCKED_JOINTS.keys()))
     N = len(waypoints)
     qpos_list, errors, col_flags = [], [], []
-    polish_thresh = min(err_thresh, 0.012)
+    q4_prev = None
 
     for i in range(N):
+        q4_anchor = q4_anchors[i]
+        q4_out = q4_anchor
         wp = waypoints[i]
-        tgt = ik_targets[i]
-        snap = (0.50 * wp + 0.50 * ee_cloud[path_idx[i]]).astype(np.float64)
+        tgt = targets[i]
 
-        solver.seed_joints(q4_smooth[i])
-        solver._lock_wrist()
-        mujoco.mj_forward(model, data)
+        if not hold_depth_x:
+            q4_base = q4_path[i]
+            if q4_prev is not None:
+                q4_seed = _clamp_q4_to_anchor(q4_prev, q4_anchor, IK_MAX_SEED_DELTA)
+            else:
+                q4_seed = q4_base
+            polish_anchor = (
+                q4_prev.copy() if q4_prev is not None else q4_anchor.copy()
+            )
+            solver.seed_joints(q4_base)
+            solver._lock_wrist()
+            mujoco.mj_forward(model, data)
+            err_base = _ee_error(model, data, ee_id, wp)
+            q4_out = q4_base
+            if (
+                err_base > IK_POLISH_TOL
+                and q4_branch_stable_with_anchor(
+                    q4_base, polish_anchor, locked_branch, model, data, addr,
+                )
+            ):
+                _, q4_pol = solver.solve_constrained(
+                    tgt, polish_anchor, q4_seed=q4_seed,
+                    max_iter=min(50, max_iter),
+                    tol=IK_POLISH_TOL,
+                    max_delta=IK_MAX_ANCHOR_DELTA,
+                )
+                solver.seed_joints(q4_pol)
+                solver._lock_wrist()
+                mujoco.mj_forward(model, data)
+                err_pol = _ee_error(model, data, ee_id, wp)
+                col_pol = _has_penetration(model, data, arm_ids, obstacle_ids)
+                roll_jump = (
+                    q4_prev is not None
+                    and abs(q4_pol[Q4_ROLL_IDX] - q4_prev[Q4_ROLL_IDX]) > IK_MAX_ROLL_STEP
+                )
+                if (
+                    not col_pol
+                    and not roll_jump
+                    and err_pol < err_base
+                    and q4_branch_stable_with_anchor(
+                        q4_pol, polish_anchor, locked_branch, model, data, addr,
+                    )
+                ):
+                    q4_out = q4_pol
+            if not q4_branch_stable_with_anchor(
+                q4_out, polish_anchor, locked_branch, model, data, addr,
+            ):
+                q4_out = q4_anchor
+            if (
+                q4_prev is not None
+                and abs(q4_out[Q4_ROLL_IDX] - q4_prev[Q4_ROLL_IDX]) > IK_MAX_ROLL_STEP
+            ):
+                q4_out = q4_anchor
+
+        qpos_i = _qpos_from_q4_seed(solver, model, data, q4_out)
         err = _ee_error(model, data, ee_id, wp)
-
-        if err > polish_thresh:
-            err, _ = solver.solve(tgt, max_iter=max_iter)
-            err = _ee_error(model, data, ee_id, wp)
-
-        if err > err_thresh:
-            solver.seed_joints(joint_configs[path_idx[i]])
-            solver._lock_wrist()
-            mujoco.mj_forward(model, data)
-            err, _ = solver.solve(snap, max_iter=max_iter * 2)
-            err = _ee_error(model, data, ee_id, wp)
-
-        if err > err_thresh:
-            solver.seed_joints(joint_configs[path_idx[i]])
-            solver._lock_wrist()
-            mujoco.mj_forward(model, data)
-            err = _ee_error(model, data, ee_id, wp)
-
-        solver._lock_wrist()
-        mujoco.mj_forward(model, data)
         col = _has_penetration(model, data, arm_ids, obstacle_ids)
-        qpos_list.append(data.qpos.copy())
+        qpos_i, err = _enforce_posture_qpos(
+            qpos_i, q4_anchor, locked_branch,
+            solver, model, data, addr, ee_id, wp,
+        )
+        col = _has_penetration(model, data, arm_ids, obstacle_ids) or col
+
+        qpos_list.append(qpos_i)
         errors.append(err)
         col_flags.append(col)
+        q4_prev = _q4_from_qpos(data, addr)
         if show_progress and (i + 1) % 50 == 0:
             print(f"    IK {i+1}/{N}", end="\r", flush=True)
     if show_progress and N >= 50:
@@ -418,11 +734,11 @@ def solve_waypoints_ik(
     errors = np.array(errors)
     col_ratio = float(np.mean(col_flags))
     qvel_arr, timestamps = _qpos_vel_from_sequence(qpos_arr, fps, model.nv)
-    return qpos_arr, qvel_arr, timestamps, errors, col_ratio
+    return qpos_arr, qvel_arr, timestamps, errors, col_ratio, locked_branch
 
 
 def check_feasibility(errors, col_ratio,
-                      err_thresh=IK_ERR_THRESH, max_col_ratio=0.05,
+                      err_thresh=IK_ERR_THRESH, max_col_ratio=MAX_COL_RATIO,
                       min_ok_ratio=IK_MIN_OK_RATIO):
     ok_ratio = (errors < err_thresh).mean()
     return ok_ratio >= min_ok_ratio and col_ratio <= max_col_ratio
@@ -438,6 +754,41 @@ def make_joint_transition_qpos(q_from, q_to, n_frames, active_qpos_addrs):
             q[a] = (1.0 - t) * q_from[a] + t * q_to[a]
         out.append(q)
     return np.array(out, dtype=np.float32)
+
+
+def solve_transition_segment(
+    p_from: np.ndarray,
+    p_to: np.ndarray,
+    n_frames: int,
+    ee_cloud: np.ndarray,
+    joint_configs: np.ndarray,
+    fps: float,
+    solver,
+    model,
+    data,
+    arm_ids,
+    obstacle_ids,
+    locked_branch: str | None,
+    elbow_branch_mode: str = ELBOW_BRANCH_AUTO,
+):
+    """层间/形状间过渡：对末端路点做 IK，避免关节线性插值导致肘部翻折。"""
+    if n_frames <= 0:
+        return (
+            np.zeros((0, model.nq), dtype=np.float32),
+            np.zeros((0, model.nv), dtype=np.float32),
+            np.zeros(0, dtype=np.float32),
+        )
+    wps = make_transition_waypoints(p_from, p_to, n_frames)
+    qp, qv, ts, _, _, _ = solve_waypoints_ik(
+        wps, ee_cloud, joint_configs, fps,
+        solver, model, data, arm_ids, obstacle_ids,
+        show_progress=False,
+        elbow_branch_mode=elbow_branch_mode,
+        locked_branch=locked_branch,
+        closed_path=False,
+        smooth_passes=2,
+    )
+    return qp, qv, ts
 
 
 def make_transition_waypoints(p0, p1, n_frames):
@@ -468,6 +819,7 @@ def generate_multi_shape_trajectory(
     rng,
     front_x_min=DEFAULT_FRONT_X_MIN,
     front_x_max=DEFAULT_FRONT_X_MAX,
+    elbow_branch_mode=ELBOW_BRANCH_AUTO,
 ):
     model = mujoco.MjModel.from_xml_path(ROBOT_XML)
     data = mujoco.MjData(model)
@@ -475,7 +827,8 @@ def generate_multi_shape_trajectory(
     _reset_to_home(model, data, addr)
     solver = IKSolver4DOF(model, data)
     arm_ids, obstacle_ids = _build_collision_id_sets(
-        model, _OBSTACLE_BODY_NAMES_MINIMAL, ee_body_names=_EE_COLLISION_BODY_NAMES
+        model, _OBSTACLE_BODY_NAMES_MINIMAL,
+        ee_body_names=_RIGHT_ARM_COLLISION_BODY_NAMES,
     )
 
     ee_cloud, joint_configs, ws = build_reachable_workspace(
@@ -486,8 +839,8 @@ def generate_multi_shape_trajectory(
           f"盒 x[{ws.lo[0]:.2f},{ws.hi[0]:.2f}] "
           f"y[{ws.lo[1]:.2f},{ws.hi[1]:.2f}] z[{ws.lo[2]:.2f},{ws.hi[2]:.2f}]")
 
-    plans = plan_shapes_stratified(num_shapes, rng)
-    print("  形状规划（各轴约 N/2 分层）:")
+    plans = plan_shapes_stratified(num_shapes, rng, ws)
+    print("  形状规划（左/右/上/下/前/后/大/小约 N/2，尺度由边界余量采样）:")
     for i, pl in enumerate(plans):
         print(f"    [{i+1}] {pl['shape']:14s} {_plan_label(pl)}")
 
@@ -498,6 +851,7 @@ def generate_multi_shape_trajectory(
     qpos_seed = None
     t_accum = 0.0
     dt = 1.0 / fps
+    traj_locked_branch = None
 
     for s_idx, plan in enumerate(plans):
         shape = plan["shape"]
@@ -512,14 +866,13 @@ def generate_multi_shape_trajectory(
             _reset_to_home(model, data, addr)
 
         center = pick_center_in_region(ee_cloud, ws, plan, rng)
-        scale, scale_fit, scale_frac = compute_safe_scale(
+        scale, scale_max, scale_frac = compute_safe_scale(
             center, theta, shape, plan, ws, rng
         )
-        scale_floor = _scale_floor_for_plan(plan, scale_fit)
         try:
             shape_wps, scale = fit_shape_waypoints_to_workspace(
                 shape, center, scale, theta, frames_per_shape, ee_cloud, rng,
-                scale_floor=scale_floor, is_large=plan["large"],
+                ws=ws, scale_max=scale_max,
             )
         except RuntimeError as exc:
             raise RuntimeError(f"形状 {s_idx+1}: {exc}") from exc
@@ -543,14 +896,13 @@ def generate_multi_shape_trajectory(
             elif ik_try == 2:
                 extra = ", 换中心"
                 center = pick_center_in_region(ee_cloud, ws, plan, rng)
-                scale, scale_fit, scale_frac = compute_safe_scale(
+                scale, scale_max, scale_frac = compute_safe_scale(
                     center, theta, shape, plan, ws, rng
                 )
-                scale_floor = _scale_floor_for_plan(plan, scale_fit)
                 try:
                     shape_wps, scale = fit_shape_waypoints_to_workspace(
                         shape, center, scale, theta, frames_per_shape, ee_cloud, rng,
-                        scale_floor=scale_floor, is_large=plan["large"],
+                        ws=ws, scale_max=scale_max,
                     )
                 except RuntimeError:
                     continue
@@ -567,24 +919,28 @@ def generate_multi_shape_trajectory(
                 ik_targets = blend_waypoints_to_workspace(shape_wps, ee_cloud, 0.55)
                 max_iter = 200
             elif ik_try >= 5:
-                scale = max(scale * 0.90, scale_floor)
+                scale = max(scale - SCALE_SHRINK_STEP, SCALE_MIN)
                 extra = f", scale={scale:.3f}"
                 ik_targets = blend_waypoints_to_workspace(shape_wps, ee_cloud, 0.45)
                 try:
                     shape_wps, scale = fit_shape_waypoints_to_workspace(
                         shape, center, scale, theta, frames_per_shape, ee_cloud, rng,
-                        scale_floor=scale_floor, is_large=plan["large"],
+                        ws=ws, scale_max=scale_max, min_scale=scale,
                     )
                 except RuntimeError:
                     continue
 
             print(f"  形状 {s_idx+1}/{num_shapes}: IK ({len(shape_wps)} 点{extra}) ...",
                   flush=True)
-            qp_shape, qv_shape, ts_shape, errs, col_r = solve_waypoints_ik(
-                shape_wps, ee_cloud, joint_configs, fps,
-                solver, model, data, arm_ids, obstacle_ids,
-                max_iter=max_iter, show_progress=(ik_try == 0),
-                ik_targets=ik_targets,
+            qp_shape, qv_shape, ts_shape, errs, col_r, traj_locked_branch = (
+                solve_waypoints_ik(
+                    shape_wps, ee_cloud, joint_configs, fps,
+                    solver, model, data, arm_ids, obstacle_ids,
+                    max_iter=max_iter, show_progress=(ik_try == 0),
+                    ik_targets=ik_targets,
+                    elbow_branch_mode=elbow_branch_mode,
+                    locked_branch=traj_locked_branch,
+                )
             )
             ok_ratio = float(np.mean(errs < IK_ERR_THRESH))
             if check_feasibility(errs, col_r):
@@ -603,10 +959,13 @@ def generate_multi_shape_trajectory(
         ts_seg = ts_shape
 
         if qpos_seed is not None and transition_frames > 0:
-            qp_trans = make_joint_transition_qpos(
-                qpos_seed, qp_shape[0], transition_frames, active_qpos_addrs
+            qp_trans, qv_trans, ts_trans = solve_transition_segment(
+                prev_last_wp, shape_wps[0], transition_frames,
+                ee_cloud, joint_configs, fps,
+                solver, model, data, arm_ids, obstacle_ids,
+                locked_branch=traj_locked_branch,
+                elbow_branch_mode=elbow_branch_mode,
             )
-            qv_trans, ts_trans = _qpos_vel_from_sequence(qp_trans, fps, model.nv)
             qp_seg = np.vstack([qp_trans, qp_shape])
             qv_seg = np.vstack([qv_trans, qv_shape])
             ts_seg = np.concatenate([
@@ -634,7 +993,7 @@ def generate_multi_shape_trajectory(
         sz = "大" if plan["large"] else "小"
         print(f"  形状 {s_idx+1}/{num_shapes}: OK {shape} [{sz}] "
               f"center=({center[0]:.2f},{center[1]:.2f},{center[2]:.2f}) "
-              f"scale={scale:.3f} (fit={scale_fit:.3f} frac={scale_frac:.2f}) "
+              f"scale={scale:.3f} (max={scale_max:.3f} frac={scale_frac:.2f}) "
               f"ok_ratio={ok_ratio:.2f}", flush=True)
 
     return {
@@ -654,8 +1013,7 @@ def generate_multi_shape_trajectory(
 
 def save_trajectory_npz(traj, fps, out_path):
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    np.savez_compressed(
-        out_path,
+    payload = dict(
         qpos=traj["qpos"],
         qvel=traj["qvel"],
         timestamps=traj["timestamps"],
@@ -664,6 +1022,11 @@ def save_trajectory_npz(traj, fps, out_path):
         segment_starts=traj["segment_starts"],
         shape_centers=traj["shape_centers"],
     )
+    if "waypoints" in traj:
+        payload["waypoints"] = traj["waypoints"]
+    if "shape_name" in traj:
+        payload["shape_name"] = traj["shape_name"]
+    np.savez_compressed(out_path, **payload)
     n = len(traj["qpos"])
     print(f"\n已保存 -> {out_path}")
     print(f"  帧数={n} fps={fps:.0f} 时长={n/fps:.1f}s 形状数={len(traj['shape_names'])}")
@@ -726,7 +1089,7 @@ def preview_trajectory(traj, fps, out_path=None, auto_save=False):
                     scn.ngeom = 0
                     _add_red_markers(
                         scn, vis_wps, size=0.006,
-                        rgba=np.array([1, 0.2, 0.2, 0.5], np.float32),
+                        rgba=np.array([0.95, 0.85, 0.1, 0.55], np.float32),
                     )
                     step = max(1, len(trail) // 200)
                     _add_red_markers(
@@ -768,6 +1131,8 @@ def main():
     p.add_argument("--ws-cache", action="store_true", help="加载可行域缓存")
     p.add_argument("--front-x-min", type=float, default=DEFAULT_FRONT_X_MIN)
     p.add_argument("--front-x-max", type=float, default=DEFAULT_FRONT_X_MAX)
+    p.add_argument("--elbow-branch", type=str, default=ELBOW_BRANCH_AUTO,
+                   help="肘部折向: outward(外翻)/inward(内翻)/auto(默认,参考图四自然姿态)")
     args = p.parse_args()
 
     if not args.preview and not args.batch:
@@ -792,6 +1157,9 @@ def main():
     print(f"\n生成 {args.num_shapes} 个分层形状 @ {args.fps:.0f} Hz, "
           f"{args.frames_per_shape} 帧/形状 (~{est} IK 帧)...")
 
+    elbow_mode = resolve_branch_mode(args.elbow_branch)
+    print(f"肘部折向模式: {elbow_mode}")
+
     traj = generate_multi_shape_trajectory(
         ee_cloud, joint_configs,
         num_shapes=args.num_shapes,
@@ -801,6 +1169,7 @@ def main():
         rng=rng,
         front_x_min=args.front_x_min,
         front_x_max=args.front_x_max,
+        elbow_branch_mode=elbow_mode,
     )
 
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")

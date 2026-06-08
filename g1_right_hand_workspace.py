@@ -57,12 +57,19 @@ LOCKED_JOINTS = {
     "right_wrist_yaw_joint": 0.0,
 }
 
-# 碰撞只检查末端（手腕+橡皮手），与拖拽时“手不穿躯干”一致；
-# 上臂连杆网格与躯干轻触/近距不算碰撞（全臂检查会裁掉贴近胸口的可达域）。
-_EE_COLLISION_BODY_NAMES = [
+# 右臂碰撞检测：肩→肘→腕→手 全部参与，防止前臂/肘穿躯干。
+_RIGHT_ARM_COLLISION_BODY_NAMES = [
+    "right_shoulder_pitch_link",
+    "right_shoulder_roll_link",
+    "right_shoulder_yaw_link",
+    "right_elbow_link",
+    "right_wrist_roll_link",
+    "right_wrist_pitch_link",
     "right_wrist_yaw_link",
     "right_rubber_hand",
 ]
+# 兼容旧名
+_EE_COLLISION_BODY_NAMES = _RIGHT_ARM_COLLISION_BODY_NAMES
 
 _OBSTACLE_BODY_NAMES_MINIMAL = ["pelvis", "torso_link", "head_link"]
 
@@ -72,6 +79,8 @@ HOME_PELVIS_QUAT = np.array([1.0, 0.0, 0.0, 0.0])
 # 骨盆前方 x>0 即算身前；0.15 过严会裁掉贴近胸口的拖拽姿态
 DEFAULT_FRONT_X_MIN = 0.05
 DEFAULT_FRONT_X_MAX = 0.55
+# 轨迹中心随机采样时，相对可达域边界 xyz 各向内缩进（避免伸直难动区域）
+CENTER_SAMPLE_INSET = 0.10
 PENETRATION_THRESH = -0.0005
 PROBE_OK_DIST = 0.045
 
@@ -99,7 +108,7 @@ def _build_addr_table(model, names):
 def _build_collision_id_sets(model, obstacle_names,
                              ee_body_names=None):
     if ee_body_names is None:
-        ee_body_names = _EE_COLLISION_BODY_NAMES
+        ee_body_names = _RIGHT_ARM_COLLISION_BODY_NAMES
     def _ids(names):
         s = set()
         for n in names:
@@ -111,7 +120,12 @@ def _build_collision_id_sets(model, obstacle_names,
 
 
 def _has_penetration(model, data, arm_ids, obstacle_ids):
-    """仅真实穿透算碰撞（与 MuJoCo 拖拽轻触仍可用一致）。"""
+    """检测右臂与躯干/头部的真实穿透（须先 mj_forward + mj_collision）。"""
+    mujoco.mj_forward(model, data)
+    try:
+        mujoco.mj_collision(model, data)
+    except Exception:
+        return True
     for i in range(data.ncon):
         c = data.contact[i]
         if c.dist > PENETRATION_THRESH:
@@ -136,6 +150,20 @@ def _reset_to_home(model, data, addr):
 
 
 @dataclasses.dataclass
+class WorkspaceEnvelope:
+    """沿 x 轴分片的 yz 平面可达边界（用于估算中心点处最大形状尺度）。"""
+    x_edges: np.ndarray
+    y_lo: np.ndarray
+    y_hi: np.ndarray
+    z_lo: np.ndarray
+    z_hi: np.ndarray
+
+    @property
+    def n_slices(self) -> int:
+        return len(self.y_lo)
+
+
+@dataclasses.dataclass
 class ReachableWorkspace:
     """正前方过滤后的右手可达域盒。"""
     lo: np.ndarray
@@ -143,6 +171,70 @@ class ReachableWorkspace:
     mid: np.ndarray
     n_samples: int
     x_band: tuple[float, float]
+    envelope: WorkspaceEnvelope | None = None
+
+
+def build_workspace_envelope(ee_cloud: np.ndarray,
+                           n_x_bins: int = 48) -> WorkspaceEnvelope:
+    """按 x 分箱，记录每个切片在 yz 平面上的点云边界。"""
+    ee = np.asarray(ee_cloud, dtype=np.float64)
+    x_edges = np.linspace(ee[:, 0].min(), ee[:, 0].max(), n_x_bins + 1)
+    y_lo = np.zeros(n_x_bins, dtype=np.float64)
+    y_hi = np.zeros(n_x_bins, dtype=np.float64)
+    z_lo = np.zeros(n_x_bins, dtype=np.float64)
+    z_hi = np.zeros(n_x_bins, dtype=np.float64)
+    global_y = (ee[:, 1].min(), ee[:, 1].max())
+    global_z = (ee[:, 2].min(), ee[:, 2].max())
+    for i in range(n_x_bins):
+        lo_x, hi_x = x_edges[i], x_edges[i + 1]
+        if i < n_x_bins - 1:
+            m = (ee[:, 0] >= lo_x) & (ee[:, 0] < hi_x)
+        else:
+            m = (ee[:, 0] >= lo_x) & (ee[:, 0] <= hi_x)
+        sl = ee[m]
+        if len(sl) < 8:
+            y_lo[i], y_hi[i] = global_y
+            z_lo[i], z_hi[i] = global_z
+        else:
+            y_lo[i] = sl[:, 1].min()
+            y_hi[i] = sl[:, 1].max()
+            z_lo[i] = sl[:, 2].min()
+            z_hi[i] = sl[:, 2].max()
+    return WorkspaceEnvelope(
+        x_edges=x_edges, y_lo=y_lo, y_hi=y_hi, z_lo=z_lo, z_hi=z_hi,
+    )
+
+
+def _envelope_slice_weights(envelope: WorkspaceEnvelope, x: float):
+    edges = envelope.x_edges
+    n = envelope.n_slices
+    if x <= edges[0]:
+        return 0, 1.0, 0.0
+    if x >= edges[-1]:
+        return n - 1, 1.0, 0.0
+    i = int(np.searchsorted(edges, x, side="right") - 1)
+    i = min(max(i, 0), n - 2)
+    w = (x - edges[i]) / max(edges[i + 1] - edges[i], 1e-9)
+    return i, 1.0 - w, w
+
+
+def envelope_bounds_at(envelope: WorkspaceEnvelope, x: float):
+    i, w0, w1 = _envelope_slice_weights(envelope, x)
+    y_lo = w0 * envelope.y_lo[i] + w1 * envelope.y_lo[i + 1]
+    y_hi = w0 * envelope.y_hi[i] + w1 * envelope.y_hi[i + 1]
+    z_lo = w0 * envelope.z_lo[i] + w1 * envelope.z_lo[i + 1]
+    z_hi = w0 * envelope.z_hi[i] + w1 * envelope.z_hi[i + 1]
+    return y_lo, y_hi, z_lo, z_hi
+
+
+def envelope_margins_at(envelope: WorkspaceEnvelope, center: np.ndarray,
+                        margin: float = 0.012):
+    """中心点到当前 x 切片 yz 边界的最近余量 (my, mz)。"""
+    y_lo, y_hi, z_lo, z_hi = envelope_bounds_at(envelope, float(center[0]))
+    cy, cz = float(center[1]), float(center[2])
+    my = min(cy - y_lo, y_hi - cy) - margin
+    mz = min(cz - z_lo, z_hi - cz) - margin
+    return float(my), float(mz)
 
 
 # ══════════════════════════════════════════════
@@ -170,6 +262,13 @@ def _sample_workspace_grid(n_per_joint: int) -> tuple[np.ndarray, np.ndarray, in
                 data.qpos[addr[name][0]] = val
             mujoco.mj_forward(model, data)
             if _has_penetration(model, data, arm_ids, obstacle_ids):
+                n_col += 1
+                return
+            from g1_arm_posture import is_near_straight_arm_q4, is_upward_flip_q4
+            if is_upward_flip_q4(qvals, model, data, addr):
+                n_col += 1
+                return
+            if is_near_straight_arm_q4(qvals, model, data, addr):
                 n_col += 1
                 return
             ee_pts.append(data.xpos[ee_id].copy())
@@ -208,6 +307,9 @@ def _sample_workspace_random(n_random: int, seed: int = 0) -> tuple[np.ndarray, 
             data.qpos[addr[name][0]] = val
         mujoco.mj_forward(model, data)
         if _has_penetration(model, data, arm_ids, obstacle_ids):
+            continue
+        from g1_arm_posture import is_allowed_q4
+        if not is_allowed_q4(qvals, None, model, data, addr):
             continue
         ee_pts.append(data.xpos[ee_id].copy())
         joint_cfgs.append(qvals)
@@ -272,17 +374,84 @@ def filter_workspace_front(ee_cloud, joint_configs,
     return filtered, joint_configs[m]
 
 
+def filter_collision_free_samples(ee_cloud: np.ndarray,
+                                  joint_configs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """用全臂穿透检测过滤旧缓存中碰撞样本。"""
+    model = mujoco.MjModel.from_xml_path(ROBOT_XML)
+    data = mujoco.MjData(model)
+    addr = _build_addr_table(model, ACTIVE_JOINTS + list(LOCKED_JOINTS.keys()))
+    arm_ids, obstacle_ids = _build_collision_id_sets(model, _OBSTACLE_BODY_NAMES_MINIMAL)
+    keep = []
+    for i, q4 in enumerate(joint_configs):
+        _reset_to_home(model, data, addr)
+        for j, n in enumerate(ACTIVE_JOINTS):
+            data.qpos[addr[n][0]] = float(q4[j])
+        if not _has_penetration(model, data, arm_ids, obstacle_ids):
+            from g1_arm_posture import is_allowed_q4
+            if is_allowed_q4(q4, None, model, data, addr):
+                keep.append(i)
+    if len(keep) < 50:
+        raise RuntimeError(
+            f"全臂碰撞过滤后有效点过少: {len(keep)} / {len(ee_cloud)}，"
+            "请重建可行域: python g1_right_hand_workspace.py"
+        )
+    idx = np.asarray(keep, dtype=int)
+    return ee_cloud[idx], joint_configs[idx]
+
+
 def build_reachable_workspace(ee_cloud, joint_configs,
                             x_min=DEFAULT_FRONT_X_MIN,
                             x_max=DEFAULT_FRONT_X_MAX):
     ee, joints = filter_workspace_front(ee_cloud, joint_configs, x_min, x_max)
+    ee, joints = filter_collision_free_samples(ee, joints)
     lo = ee.min(axis=0)
     hi = ee.max(axis=0)
     ws = ReachableWorkspace(
         lo=lo, hi=hi, mid=(lo + hi) * 0.5,
         n_samples=len(ee), x_band=(x_min, x_max),
+        envelope=build_workspace_envelope(ee),
     )
     return ee, joints, ws
+
+
+def inset_bounds(lo: np.ndarray, hi: np.ndarray,
+                 inset: float = CENTER_SAMPLE_INSET) -> tuple[np.ndarray, np.ndarray]:
+    """将轴对齐包围盒各面向内缩 inset（米）。"""
+    lo = np.asarray(lo, dtype=np.float64).copy()
+    hi = np.asarray(hi, dtype=np.float64).copy()
+    lo2 = lo + inset
+    hi2 = hi - inset
+    for i in range(3):
+        if lo2[i] > hi2[i]:
+            mid = 0.5 * (lo[i] + hi[i])
+            lo2[i] = hi2[i] = mid
+    return lo2, hi2
+
+
+def mask_points_in_box(points: np.ndarray, lo: np.ndarray, hi: np.ndarray,
+                       eps: float = 1e-6) -> np.ndarray:
+    return (
+        (points[:, 0] >= lo[0] - eps) & (points[:, 0] <= hi[0] + eps) &
+        (points[:, 1] >= lo[1] - eps) & (points[:, 1] <= hi[1] + eps) &
+        (points[:, 2] >= lo[2] - eps) & (points[:, 2] <= hi[2] + eps)
+    )
+
+
+def sample_center_from_cloud(
+    ee_cloud: np.ndarray,
+    lo: np.ndarray,
+    hi: np.ndarray,
+    rng: np.random.Generator,
+    inset: float = CENTER_SAMPLE_INSET,
+) -> np.ndarray:
+    """在缩进后的包围盒内随机选轨迹中心，避开边缘伸直区域。"""
+    lo_i, hi_i = inset_bounds(lo, hi, inset)
+    mask = mask_points_in_box(ee_cloud, lo_i, hi_i)
+    pool = ee_cloud[mask]
+    if len(pool) < 8:
+        pool = ee_cloud
+    idx = int(rng.integers(0, len(pool)))
+    return pool[idx].astype(np.float64).copy()
 
 
 def fk_ee_from_4dof(q4: np.ndarray) -> np.ndarray:
@@ -599,7 +768,7 @@ def build_workspace_cache(
         ee_positions=pts,
         joint_configs=joints,
         obstacle_preset="minimal",
-        collision_mode="ee_penetration",
+        collision_mode="full_arm_penetration",
         robot_xml=ROBOT_XML,
         front_x_min=np.float32(front_x_min),
         front_x_max=np.float32(front_x_max),

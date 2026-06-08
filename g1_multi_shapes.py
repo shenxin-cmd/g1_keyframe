@@ -9,14 +9,30 @@ import numpy as np
 
 SHAPE_NAMES = [
     "circle",
+    "ellipse",
     "square",
     "rectangle",
     "triangle",
+    "triangle_down",
     "pentagon",
     "star",
     "heart",
     "wave",
     "diamond",
+    "random_polygon",
+    "random_spline",
+]
+
+# 同心递减轨迹常用形状（CLI 别名见 g1_concentric_traj_gen.py）
+CONCENTRIC_SHAPE_NAMES = [
+    "circle",
+    "ellipse",
+    "triangle",
+    "triangle_down",
+    "square",
+    "rectangle",
+    "star",
+    "pentagon",
     "random_polygon",
     "random_spline",
 ]
@@ -94,6 +110,11 @@ def make_circle_local(N: int) -> np.ndarray:
     return np.stack([np.sin(t), np.cos(t)], axis=1)
 
 
+def make_ellipse_local(N: int, aspect: float = 1.55) -> np.ndarray:
+    t = np.linspace(0, 2 * np.pi, N, endpoint=False)
+    return np.stack([aspect * np.sin(t), np.cos(t)], axis=1)
+
+
 def make_square_local(N: int) -> np.ndarray:
     return _rounded_rect_local(1.0, 1.0, N)
 
@@ -104,6 +125,12 @@ def make_rectangle_local(N: int, aspect: float = 1.4) -> np.ndarray:
 
 def make_triangle_local(N: int) -> np.ndarray:
     angles = np.linspace(np.pi / 2, np.pi / 2 + 2 * np.pi, 4, endpoint=True)
+    pts = [[np.cos(a), np.sin(a)] for a in angles]
+    return _resample_polyline(pts, N)
+
+
+def make_triangle_down_local(N: int) -> np.ndarray:
+    angles = np.linspace(-np.pi / 2, -np.pi / 2 + 2 * np.pi, 4, endpoint=True)
     pts = [[np.cos(a), np.sin(a)] for a in angles]
     return _resample_polyline(pts, N)
 
@@ -183,12 +210,16 @@ def make_shape_local(shape_name: str, N: int, rng: np.random.Generator) -> np.nd
     name = shape_name.lower()
     if name == "circle":
         return make_circle_local(N)
+    if name == "ellipse":
+        return make_ellipse_local(N)
     if name == "square":
         return make_square_local(N)
     if name == "rectangle":
         return make_rectangle_local(N)
     if name == "triangle":
         return make_triangle_local(N)
+    if name in ("triangle_down", "inverted_triangle", "倒三角"):
+        return make_triangle_down_local(N)
     if name == "pentagon":
         return make_pentagon_local(N)
     if name == "star":
