@@ -33,6 +33,7 @@ CONCENTRIC_SHAPE_NAMES = [
     "rectangle",
     "star",
     "pentagon",
+    "heart",
     "random_polygon",
     "random_spline",
 ]

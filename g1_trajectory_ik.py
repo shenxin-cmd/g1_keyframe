@@ -24,6 +24,10 @@ G1 右手轨迹逆运动学（成熟方法实现，独立于 g1_multi_shape_traj
   - Buss (2009) DLS + 零空间姿态维持（Pink / Stack-of-Tasks）
   - 在阶段 A 解的基础上做 2~3 轮序列精化
 
+**人类化运动约束**
+  - 优先使用肘关节，其次肩 roll/pitch，最后肩 yaw（加权 Δq 代价）
+  - 肩 roll/pitch/yaw 每帧严格限速，禁止突变
+
 参考文献
 --------
 - Buss, "Introduction to Inverse Kinematics" (DLS / 零空间)
@@ -36,6 +40,7 @@ G1 右手轨迹逆运动学（成熟方法实现，独立于 g1_multi_shape_traj
 ----
   python g1_trajectory_ik.py --shape circle --center 0.27 -0.25 1.01 --preview --save
   python g1_trajectory_ik.py --shape circle --layers 4 --ws-cache --elbow-branch outward --save
+  python g1_trajectory_ik.py --shape circle --layers 6 --num-trajs 5 --seed 42 --ws-cache --save
 
 在其它脚本中：
   from g1_trajectory_ik import TrajectoryIKSolver, solve_trajectory_ik
@@ -104,6 +109,24 @@ DIST_BLEND = 0.55         # TRAC-IK Distance：连续性权重（防解支跳变
 ROLL_BLEND = 0.35
 MAX_ROLL_STEP = 0.10
 SQP_MAXITER = 45
+
+# q4 顺序：pitch(0), roll(1), yaw(2), elbow(3)
+IDX_PITCH, IDX_ROLL, IDX_YAW, IDX_ELBOW = 0, 1, 2, 3
+SHOULDER_IDXS = (IDX_PITCH, IDX_ROLL, IDX_YAW)
+
+# 加权 Δq：值越大越不愿动该关节（人类：肘优先，yaw 最后）
+W_DQ_ELBOW = 0.35
+W_DQ_ROLL = 2.8
+W_DQ_PITCH = 2.8
+W_DQ_YAW = 6.5
+HUMAN_MOTION_BLEND = 0.0   # 人类化由逐步硬限位实现，不用软代价
+ENABLE_GS_REFINE = False   # GS 精化会破坏肩逐步限速
+
+# 每帧最大关节步长 (rad)，肩三轴严格限速
+MAX_STEP_ELBOW = 0.13
+MAX_STEP_SHOULDER = 0.038   # pitch / roll 每帧上限 (rad)
+MAX_STEP_YAW = 0.018        # yaw 最慢
+SHOULDER_DLS_SCALE = 0.30  # DLS 主任务中肩关节增量缩放
 
 
 @dataclasses.dataclass
@@ -185,6 +208,127 @@ def _null_projector(J: np.ndarray, lam: float) -> np.ndarray:
     return np.eye(n) - J_pinv @ J
 
 
+def _weighted_dq_cost(dq: np.ndarray) -> float:
+    """人类化加权关节位移代价（越小越像人）。"""
+    dq = np.asarray(dq, dtype=np.float64).reshape(4)
+    return float(
+        W_DQ_PITCH * dq[IDX_PITCH] ** 2
+        + W_DQ_ROLL * dq[IDX_ROLL] ** 2
+        + W_DQ_YAW * dq[IDX_YAW] ** 2
+        + W_DQ_ELBOW * dq[IDX_ELBOW] ** 2
+    )
+
+
+def _max_shoulder_step(q_new: np.ndarray, q_prev: np.ndarray) -> float:
+    dq = np.abs(np.asarray(q_new, dtype=np.float64) - np.asarray(q_prev, dtype=np.float64))
+    return float(np.max(dq[list(SHOULDER_IDXS)]))
+
+
+def _human_step_bounds(
+    q_prev: np.ndarray | None,
+    lo: np.ndarray,
+    hi: np.ndarray,
+) -> list[tuple[float, float]]:
+    """逐帧动态限位：优化在「人类可接受的小步」框内求末端最优。"""
+    if q_prev is None:
+        return list(zip(lo.tolist(), hi.tolist()))
+    q_prev = np.asarray(q_prev, dtype=np.float64).reshape(4)
+    d_el = MAX_STEP_ELBOW
+    d_sh = MAX_STEP_SHOULDER
+    d_yaw = MAX_STEP_YAW
+    lo_d = lo.copy()
+    hi_d = hi.copy()
+    lo_d[IDX_ELBOW] = max(lo[IDX_ELBOW], q_prev[IDX_ELBOW] - d_el)
+    hi_d[IDX_ELBOW] = min(hi[IDX_ELBOW], q_prev[IDX_ELBOW] + d_el)
+    lo_d[IDX_PITCH] = max(lo[IDX_PITCH], q_prev[IDX_PITCH] - d_sh)
+    hi_d[IDX_PITCH] = min(hi[IDX_PITCH], q_prev[IDX_PITCH] + d_sh)
+    lo_d[IDX_ROLL] = max(lo[IDX_ROLL], q_prev[IDX_ROLL] - d_sh)
+    hi_d[IDX_ROLL] = min(hi[IDX_ROLL], q_prev[IDX_ROLL] + d_sh)
+    lo_d[IDX_YAW] = max(lo[IDX_YAW], q_prev[IDX_YAW] - d_yaw)
+    hi_d[IDX_YAW] = min(hi[IDX_YAW], q_prev[IDX_YAW] + d_yaw)
+    return list(zip(lo_d.tolist(), hi_d.tolist()))
+
+
+def _project_human_step(q_opt: np.ndarray, q_prev: np.ndarray, clip_fn) -> np.ndarray:
+    """肩三轴硬限速投影；肘保留优化结果并限幅。"""
+    q_opt = np.asarray(q_opt, dtype=np.float64).reshape(4)
+    q_prev = np.asarray(q_prev, dtype=np.float64).reshape(4)
+    q_out = q_prev.copy()
+    q_out[IDX_PITCH] = np.clip(
+        q_opt[IDX_PITCH], q_prev[IDX_PITCH] - MAX_STEP_SHOULDER, q_prev[IDX_PITCH] + MAX_STEP_SHOULDER,
+    )
+    q_out[IDX_ROLL] = np.clip(
+        q_opt[IDX_ROLL], q_prev[IDX_ROLL] - MAX_STEP_SHOULDER, q_prev[IDX_ROLL] + MAX_STEP_SHOULDER,
+    )
+    q_out[IDX_YAW] = np.clip(
+        q_opt[IDX_YAW], q_prev[IDX_YAW] - MAX_STEP_YAW, q_prev[IDX_YAW] + MAX_STEP_YAW,
+    )
+    q_out[IDX_ELBOW] = np.clip(
+        q_opt[IDX_ELBOW], q_prev[IDX_ELBOW] - MAX_STEP_ELBOW, q_prev[IDX_ELBOW] + MAX_STEP_ELBOW,
+    )
+    return clip_fn(q_out)
+
+
+def _apply_dq_human_limits(dq: np.ndarray) -> np.ndarray:
+    """DLS 增量按关节优先级限幅。"""
+    dq = np.asarray(dq, dtype=np.float64).reshape(4).copy()
+    step = {IDX_PITCH: MAX_STEP_SHOULDER, IDX_ROLL: MAX_STEP_SHOULDER, IDX_YAW: MAX_STEP_YAW}
+    for j in SHOULDER_IDXS:
+        dq[j] *= SHOULDER_DLS_SCALE
+        dq[j] = np.clip(dq[j], -step[j], step[j])
+    dq[IDX_ELBOW] = np.clip(dq[IDX_ELBOW], -MAX_STEP_ELBOW, MAX_STEP_ELBOW)
+    return dq
+
+
+def _elbow_compensate(
+    arm: G1RightArmModel,
+    target: np.ndarray,
+    q_start: np.ndarray,
+    q_prev: np.ndarray,
+    locked_branch: str | None,
+    arm_ids,
+    obstacle_ids,
+    tol: float = POS_TOL,
+    max_iters: int = 40,
+) -> np.ndarray:
+    """
+    肩三轴已限速后，仅用肘关节微调末端（人类：先动肘）。
+    肩关节相对 q_prev 保持硬约束。
+    """
+    q = arm.clip_q4(q_start)
+    shoulder_fix = q[list(SHOULDER_IDXS)].copy()
+    target = np.asarray(target, dtype=np.float64).reshape(3)
+    for _ in range(max_iters):
+        arm.set_q4(q)
+        err_norm, err_vec = arm.pos_error(target)
+        if err_norm <= tol:
+            break
+        J = arm.position_jacobian()
+        col = J[:, IDX_ELBOW]
+        denom = float(col @ col) + LAMBDA0 ** 2
+        dq_el = float(col @ err_vec / denom)
+        q_try = q.copy()
+        q_try[IDX_ELBOW] = np.clip(
+            q[IDX_ELBOW] + np.clip(dq_el, -MAX_STEP_ELBOW, MAX_STEP_ELBOW),
+            q_prev[IDX_ELBOW] - MAX_STEP_ELBOW,
+            q_prev[IDX_ELBOW] + MAX_STEP_ELBOW,
+        )
+        q_try[list(SHOULDER_IDXS)] = shoulder_fix
+        q_try = arm.clip_q4(q_try)
+        arm.set_q4(q_try)
+        if locked_branch and not is_allowed_q4(
+            q_try, locked_branch, arm.model, arm.data, arm.addr,
+        ):
+            break
+        if _has_penetration(arm.model, arm.data, arm_ids, obstacle_ids):
+            break
+        err_try, _ = arm.pos_error(target)
+        if err_try >= err_norm:
+            break
+        q = q_try
+    return q
+
+
 def _branch_reference_q4(branch: str | None) -> np.ndarray:
     """分支参考姿态（零空间吸引目标）。"""
     q = NATURAL_Q4_REF.copy()
@@ -207,13 +351,15 @@ class TracIkStyleSolver:
         self.arm = arm
         self.arm_ids = arm_ids
         self.obstacle_ids = obstacle_ids
-        self._bounds = list(zip(arm.ranges[:, 0], arm.ranges[:, 1]))
+        self._lo = arm.ranges[:, 0].copy()
+        self._hi = arm.ranges[:, 1].copy()
 
     def _optimize_from_seed(
         self,
         target: np.ndarray,
         q_seed: np.ndarray,
         locked_branch: str | None,
+        q_prev: np.ndarray | None = None,
     ) -> tuple[np.ndarray, float]:
         target = np.asarray(target, dtype=np.float64).reshape(3)
         q_seed = self.arm.clip_q4(q_seed)
@@ -222,6 +368,8 @@ class TracIkStyleSolver:
             qv = self.arm.clip_q4(qv)
             self.arm.set_q4(qv)
             pos_cost = float(np.sum((self.arm.forward() - target) ** 2))
+            if q_prev is not None:
+                pos_cost += HUMAN_MOTION_BLEND * _weighted_dq_cost(qv - q_prev)
             if locked_branch is not None and not is_allowed_q4(
                 qv, locked_branch, self.arm.model, self.arm.data, self.arm.addr,
             ):
@@ -232,9 +380,13 @@ class TracIkStyleSolver:
                 pos_cost += REFINE_COL_PENALTY
             return pos_cost
 
+        if q_prev is not None:
+            bounds = _human_step_bounds(q_prev, self._lo, self._hi)
+        else:
+            bounds = list(zip(self._lo.tolist(), self._hi.tolist()))
         res = minimize(
             objective, q_seed, method="L-BFGS-B",
-            bounds=self._bounds, options={"maxiter": SQP_MAXITER, "ftol": 1e-9},
+            bounds=bounds, options={"maxiter": SQP_MAXITER, "ftol": 1e-9},
         )
         q_best = self.arm.clip_q4(res.x)
         self.arm.set_q4(q_best)
@@ -276,25 +428,53 @@ class TracIkStyleSolver:
         seeds: list[np.ndarray] = []
         if q_prev is not None:
             seeds.append(self.arm.clip_q4(q_prev))
-        seeds.extend(self._workspace_seeds(
-            target, ee_cloud, joint_configs, locked_branch, k=WS_NEIGHBOR_K,
-        ))
-        if not seeds:
-            seeds.append(self.arm.clip_q4(q_ref))
+            # 人类化逐步限位下，只在 q_{i-1} 邻域内搜索；多种子易选到不可达支路
+        else:
+            seeds.extend(self._workspace_seeds(
+                target, ee_cloud, joint_configs, locked_branch, k=WS_NEIGHBOR_K,
+            ))
+            if not seeds:
+                seeds.append(self.arm.clip_q4(q_ref))
         uniq: list[np.ndarray] = []
         for s in seeds:
             if not any(np.allclose(s, u, atol=1e-4) for u in uniq):
                 uniq.append(s)
 
-        candidates: list[tuple[float, float, float, np.ndarray]] = []
+        candidates: list[tuple[float, float, float, float, np.ndarray]] = []
         for s in uniq:
-            q_opt, err = self._optimize_from_seed(target, s, locked_branch)
+            q_opt, err = self._optimize_from_seed(
+                target, s, locked_branch, q_prev=q_prev,
+            )
             if q_prev is not None:
-                d_prev = float(np.linalg.norm(q_opt - q_prev))
-                d_roll = abs(float(q_opt[1] - q_prev[1]))
+                dq = q_opt - q_prev
+                d_w = float(np.sqrt(_weighted_dq_cost(dq)))
+                d_roll = abs(float(dq[IDX_ROLL]))
+                d_sh = _max_shoulder_step(q_opt, q_prev)
             else:
-                d_prev, d_roll = 0.0, 0.0
-            candidates.append((err, d_prev, d_roll, q_opt))
+                d_w, d_roll, d_sh = 0.0, 0.0, 0.0
+            candidates.append((err, d_w, d_roll, d_sh, q_opt))
+
+        # 逐步限位不可达时，回退到全空间 IK，但仍优先选人类化候选
+        if q_prev is not None and candidates:
+            best_bounded = min(candidates, key=lambda x: x[0])
+            if best_bounded[0] > POS_TOL * 4:
+                fallback_seeds = [self.arm.clip_q4(q_prev)]
+                fallback_seeds.extend(self._workspace_seeds(
+                    target, ee_cloud, joint_configs, locked_branch, k=WS_NEIGHBOR_K,
+                ))
+                fb_uniq: list[np.ndarray] = []
+                for s in fallback_seeds:
+                    if not any(np.allclose(s, u, atol=1e-4) for u in fb_uniq):
+                        fb_uniq.append(s)
+                for s in fb_uniq:
+                    q_opt, err = self._optimize_from_seed(
+                        target, s, locked_branch, q_prev=None,
+                    )
+                    dq = q_opt - q_prev
+                    d_w = float(np.sqrt(_weighted_dq_cost(dq)))
+                    d_roll = abs(float(dq[IDX_ROLL]))
+                    d_sh = _max_shoulder_step(q_opt, q_prev)
+                    candidates.append((err, d_w, d_roll, d_sh, q_opt))
 
         if not candidates:
             raise RuntimeError("无可用 IK 初值")
@@ -302,13 +482,18 @@ class TracIkStyleSolver:
         good = [c for c in candidates if c[0] <= tol]
         pool = good if good else candidates
         if q_prev is not None:
-            tight = [c for c in pool if c[2] <= MAX_ROLL_STEP]
+            tight = [c for c in pool if c[3] <= MAX_STEP_SHOULDER + 1e-5]
             if tight:
                 pool = tight
+            tight_roll = [c for c in pool if c[2] <= MAX_ROLL_STEP]
+            if tight_roll:
+                pool = tight_roll
         pool.sort(key=lambda x: (
             x[0] + DIST_BLEND * x[1] + ROLL_BLEND * x[2], x[1], x[2],
         ))
-        err, _, _, q_best = pool[0]
+        err, _, _, _, q_best = pool[0]
+        self.arm.set_q4(q_best)
+        err = float(np.linalg.norm(self.arm.forward() - target))
         return q_best, err, err <= tol
 
 
@@ -354,8 +539,17 @@ class TaskPriorityDlsIk:
             if q_prev is not None:
                 dq_null += W_NULL_CONT * (q_prev - q)
             dq = dq_primary + N @ dq_null
-            dq = np.clip(dq, -MAX_DQ, MAX_DQ)
-            q = self.arm.clip_q4(q + dq)
+            dq = _apply_dq_human_limits(dq)
+            if q_prev is not None:
+                step_bounds = _human_step_bounds(
+                    q_prev, self.arm.ranges[:, 0], self.arm.ranges[:, 1],
+                )
+                q_tgt = self.arm.clip_q4(q + dq)
+                for j in range(4):
+                    q_tgt[j] = float(np.clip(q_tgt[j], step_bounds[j][0], step_bounds[j][1]))
+                q = q_tgt
+            else:
+                q = self.arm.clip_q4(q + dq)
 
             if locked_branch is not None and not is_allowed_q4(
                 q, locked_branch, self.arm.model, self.arm.data, self.arm.addr,
@@ -578,7 +772,7 @@ class TrajectoryIKSolver:
             if show_progress and (i + 1) % 50 == 0:
                 print(f"    TRAC-IK {i+1}/{n}", flush=True)
 
-        if refine and n <= 120:
+        if refine and ENABLE_GS_REFINE and n <= 120:
             if show_progress:
                 print("    Gauss-Seidel DLS 精化 ...", flush=True)
             gs = TrajectoryGaussSeidelRefiner(self.tp_ik, locked_branch, q_ref)
@@ -686,6 +880,14 @@ def evaluate_trajectory(
 # 同心圆 CLI（演示新 IK，不修改旧 traj_gen）
 # ══════════════════════════════════════════════
 
+def _load_reachable_workspace(ws_cache: bool):
+    if ws_cache and os.path.isfile(WS_CACHE_PATH):
+        ee, joints = load_workspace_cache()
+    else:
+        raise RuntimeError("请先运行 python g1_right_hand_workspace.py 生成可行域")
+    return build_reachable_workspace(ee, joints)
+
+
 def _generate_concentric_demo(
     shape: str,
     center: np.ndarray,
@@ -693,23 +895,19 @@ def _generate_concentric_demo(
     fps: float,
     frames_per_ring: int,
     elbow_branch_mode: str,
-    ws_cache: bool,
+    rng: np.random.Generator,
+    theta: float,
+    ee,
+    joints,
+    ws,
     refine: bool,
 ) -> dict:
-    if ws_cache and os.path.isfile(WS_CACHE_PATH):
-        ee, joints = load_workspace_cache()
-    else:
-        raise RuntimeError("请先运行 python g1_right_hand_workspace.py 生成可行域")
-    ee, joints, ws = build_reachable_workspace(ee, joints)
-
     from g1_concentric_traj_gen import (
         build_concentric_scales,
         build_concentric_waypoints,
         find_max_scale,
     )
 
-    rng = np.random.default_rng(0)
-    theta = 0.5
     scale_env, scale_max = find_max_scale(shape, center, theta, ws, ee, rng)
     scales = build_concentric_scales(scale_max, n_layers)
     rings = build_concentric_waypoints(shape, center, scales, theta, frames_per_ring, rng)
@@ -717,12 +915,13 @@ def _generate_concentric_demo(
     solver = TrajectoryIKSolver()
     all_qpos, all_qvel, all_ts, all_wps = [], [], [], []
     segment_starts = [0]
+    layer_metrics: list[dict] = []
     locked = None
     t_accum = 0.0
     dt = 1.0 / fps
 
     print(f"中心=({center[0]:.2f},{center[1]:.2f},{center[2]:.2f}) "
-          f"scale_max={scale_max:.3f} 层数={len(scales)}")
+          f"theta={theta:.2f} scale_max={scale_max:.3f} 层数={len(scales)}")
 
     for li, ring_wps in enumerate(rings):
         print(f"  层 {li+1}/{len(scales)} IK (TrajectoryIKSolver) ...", flush=True)
@@ -737,6 +936,11 @@ def _generate_concentric_demo(
         if li == 0:
             print(f"  肘部折向锁定: {locked}")
         m = evaluate_trajectory(res.qpos, ring_wps, locked)
+        layer_metrics.append({
+            "layer_idx": li + 1,
+            "scale": float(scales[li]),
+            **m,
+        })
         print(f"    err={m['err_mean_mm']:.1f}mm max={m['err_max_mm']:.1f}mm "
               f"ok={m['ok_ratio']:.2f} xflip={m['xflip']} "
               f"xspan={m['xspan_mm']:.1f}mm branch_viol={m['branch_viol']}")
@@ -759,15 +963,103 @@ def _generate_concentric_demo(
         "segment_starts": np.array(segment_starts, dtype=np.int32),
         "shape_name": shape,
         "center": center.astype(np.float32),
+        "scale_max": float(scale_max),
+        "layer_scales": scales.astype(np.float32),
+        "layer_metrics": layer_metrics,
+        "theta": float(theta),
+        "fps": float(fps),
+        "frames_per_ring": int(frames_per_ring),
+        "n_layers": int(len(scales)),
         "locked_branch": locked,
     }
+
+
+def save_trajectory_npz(path: str, traj: dict, seed: int | None = None) -> None:
+    """原子写入轨迹 NPZ（供批量流水线复用）。"""
+    # np.savez_compressed 会自动追加 .npz，故临时文件不能再用 *.npz.tmp
+    tmp = path[:-4] + ".part" if path.endswith(".npz") else path + ".part"
+    payload = dict(
+        qpos=traj["qpos"],
+        qvel=traj["qvel"],
+        timestamps=traj["timestamps"],
+        waypoints=traj["waypoints"],
+        segment_starts=traj["segment_starts"],
+        shape_name=traj["shape_name"],
+        center=traj["center"],
+        scale_max=np.float32(traj["scale_max"]),
+        layer_scales=traj["layer_scales"],
+        theta=np.float32(traj["theta"]),
+        fps=np.float32(traj["fps"]),
+        frames_per_ring=np.int32(traj["frames_per_ring"]),
+        n_layers=np.int32(traj["n_layers"]),
+        locked_branch=traj["locked_branch"],
+        ik_method="trac_ik_human",
+    )
+    if seed is not None:
+        payload["seed"] = np.int32(seed)
+    metrics = traj.get("layer_metrics")
+    if metrics:
+        for k in ("err_mean_mm", "err_max_mm", "ok_ratio", "branch_viol",
+                  "xflip", "xspan_mm", "max_droll"):
+            payload[f"layer_{k}"] = np.array(
+                [m[k] for m in metrics], dtype=np.float32,
+            )
+        payload["layer_scale_per_metric"] = np.array(
+            [m["scale"] for m in metrics], dtype=np.float32,
+        )
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    np.savez_compressed(tmp, **payload)
+    final = tmp + ".npz"
+    if not os.path.isfile(final):
+        raise FileNotFoundError(f"savez 未生成预期文件: {final}")
+    os.replace(final, path)
+
+
+def _try_generate_concentric_demo(
+    shape: str,
+    n_layers: int,
+    fps: float,
+    frames_per_ring: int,
+    elbow_branch_mode: str,
+    ee,
+    joints,
+    ws,
+    rng: np.random.Generator,
+    refine: bool,
+    center: np.ndarray | None = None,
+    theta: float | None = None,
+    max_tries: int = 12,
+) -> dict | None:
+    from g1_concentric_traj_gen import sample_center
+
+    for attempt in range(max_tries):
+        if center is not None and attempt == 0:
+            c = center.copy()
+        else:
+            c = sample_center(ee, ws, rng)
+        th = theta if (theta is not None and attempt == 0) else float(rng.uniform(0, 2 * np.pi))
+        try:
+            return _generate_concentric_demo(
+                shape, c, n_layers, fps, frames_per_ring,
+                elbow_branch_mode, rng, th, ee, joints, ws, refine,
+            )
+        except RuntimeError:
+            if center is not None:
+                break
+            continue
+    return None
 
 
 def main():
     ap = argparse.ArgumentParser(description="G1 轨迹 IK（TP-DLS + Gauss-Newton）")
     ap.add_argument("--shape", default="circle")
-    ap.add_argument("--center", nargs=3, type=float, default=[0.27, -0.25, 1.01])
+    ap.add_argument("--center", nargs=3, type=float, default=None,
+                    help="手动指定圆心；不指定则从可达域随机采样")
     ap.add_argument("--layers", type=int, default=4)
+    ap.add_argument("--num-trajs", type=int, default=1,
+                    help="生成多少条轨迹（每次随机采样不同中心/朝向）")
+    ap.add_argument("--theta", type=float, default=None, help="形状旋转角（弧度）；不指定则随机")
+    ap.add_argument("--seed", type=int, default=None, help="随机种子（可复现）")
     ap.add_argument("--fps", type=float, default=50.0)
     ap.add_argument("--frames-per-ring", type=int, default=200)
     ap.add_argument("--elbow-branch", default="outward")
@@ -777,41 +1069,50 @@ def main():
     ap.add_argument("--save", action="store_true")
     args = ap.parse_args()
 
+    if not args.ws_cache:
+        print("随机采样需要可行域缓存，请加上 --ws-cache")
+        return
+
+    from g1_concentric_traj_gen import resolve_shape_name
+
     branch = resolve_branch_mode(args.elbow_branch)
-    center = np.array(args.center, dtype=np.float64)
-    traj = _generate_concentric_demo(
-        args.shape, center, args.layers, args.fps,
-        args.frames_per_ring, branch, args.ws_cache,
-        refine=not args.no_refine,
-    )
+    shape = resolve_shape_name(args.shape)
+    rng = np.random.default_rng(args.seed)
+    ee, joints, ws = _load_reachable_workspace(args.ws_cache)
+    user_center = np.array(args.center, dtype=np.float64) if args.center else None
+    refine = not args.no_refine
+    last_traj = None
 
-    m = evaluate_trajectory(traj["qpos"], traj["waypoints"], traj["locked_branch"])
-    print(f"\n整体: err={m['err_mean_mm']:.1f}mm ok={m['ok_ratio']:.2f} "
-          f"xflip={m['xflip']} branch_viol={m['branch_viol']}")
-
-    if args.save:
-        tag = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        c = center
-        out = (
-            f"recordings/g1_tpik_{args.shape}_L{args.layers}_"
-            f"c{c[0]:.2f}_{c[1]:.2f}_{c[2]:.2f}_{tag}.npz"
+    for ti in range(args.num_trajs):
+        print(f"\n=== 轨迹 {ti + 1}/{args.num_trajs} | {shape} x{args.layers} 层 ===")
+        traj = _try_generate_concentric_demo(
+            shape, args.layers, args.fps, args.frames_per_ring,
+            branch, ee, joints, ws, rng, refine,
+            center=user_center if ti == 0 else None,
+            theta=args.theta if ti == 0 else None,
         )
-        np.savez_compressed(
-            out,
-            qpos=traj["qpos"],
-            qvel=traj["qvel"],
-            timestamps=traj["timestamps"],
-            waypoints=traj["waypoints"],
-            segment_starts=traj["segment_starts"],
-            shape_name=traj["shape_name"],
-            center=traj["center"],
-            ik_method="tp_dls_gauss_newton",
-        )
-        print(f"已保存: {out}")
+        if traj is None:
+            print(f"  轨迹 {ti + 1} 失败（中心不可行）")
+            continue
 
-    if args.preview:
+        m = evaluate_trajectory(traj["qpos"], traj["waypoints"], traj["locked_branch"])
+        print(f"\n整体: err={m['err_mean_mm']:.1f}mm ok={m['ok_ratio']:.2f} "
+              f"xflip={m['xflip']} branch_viol={m['branch_viol']}")
+        last_traj = traj
+
+        if args.save:
+            tag = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            c = traj["center"]
+            out = (
+                f"recordings/g1_tpik_{shape}_L{args.layers}_"
+                f"c{c[0]:.2f}_{c[1]:.2f}_{c[2]:.2f}_{tag}.npz"
+            )
+            save_trajectory_npz(out, traj, seed=args.seed)
+            print(f"已保存: {out}")
+
+    if args.preview and last_traj is not None:
         from g1_multi_shape_traj_gen import preview_trajectory
-        preview_trajectory(traj["qpos"], traj["waypoints"], MODEL_PATH)
+        preview_trajectory(last_traj["qpos"], last_traj["waypoints"], MODEL_PATH)
 
 
 if __name__ == "__main__":

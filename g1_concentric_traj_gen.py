@@ -85,6 +85,7 @@ SHAPE_ALIASES: dict[str, str] = {
     "rectangle": "rectangle", "长方形": "rectangle", "矩形": "rectangle",
     "star": "star", "五角星": "star", "星形": "star",
     "pentagon": "pentagon", "五边形": "pentagon",
+    "heart": "heart", "爱心": "heart",
     "random_polygon": "random_polygon", "随机": "random_polygon",
     "随机图形": "random_polygon", "random_spline": "random_spline",
 }

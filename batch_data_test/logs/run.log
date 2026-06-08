@@ -1,0 +1,2 @@
+2026-06-08 19:01:38,033 [INFO] 开始批量任务: 1 jobs | center=[0.27, -0.25, 1.01] layers=3 F=80 fps=50
+2026-06-08 19:01:48,894 [INFO] 批量结束: done=1 skipped=0 failed=0 | clips pass=0 reject=3
