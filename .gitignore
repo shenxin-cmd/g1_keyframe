@@ -5,8 +5,11 @@ __pycache__/
 recordings/
 recordings.zip
 .venv/
+batch_data_test/
 recordings/*.npz
 keyframes/
+batch_data/
+tmp/
 g1/
 go2/
 MUJOCO_LOG.TXT

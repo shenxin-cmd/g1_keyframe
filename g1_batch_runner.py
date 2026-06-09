@@ -156,7 +156,12 @@ class BatchRunner:
     def _should_skip(self, job_id: str) -> bool:
         if not self.args.resume:
             return False
-        return self._job_status(job_id) == "post_done"
+        if self._job_status(job_id) != "post_done":
+            return False
+        if self.args.no_filter:
+            rec = self._manifest.get(job_id, {})
+            return int(rec.get("n_pass", 0)) > 0
+        return True
 
     def _build_jobs(self) -> list[tuple[str, int]]:
         shapes = [resolve_shape_name(s) for s in (self.args.shapes or BATCH_SHAPES)]
@@ -177,9 +182,10 @@ class BatchRunner:
             self.args.center.tolist() if self.args.center is not None else "随机采样"
         )
         self.logger.info(
-            "开始批量任务: %d jobs | center=%s layers=%d F=%d fps=%.0f",
+            "开始批量任务: %d jobs | center=%s layers=%d F=%d fps=%.0f%s",
             len(jobs), center_desc, self.args.layers,
             self.args.frames_per_ring, self.args.fps,
+            " | 筛选已关闭(--no-filter)" if self.args.no_filter else "",
         )
 
         ee, joints, ws = _load_reachable_workspace(True)
@@ -212,10 +218,18 @@ class BatchRunner:
                     started_at=self._utcnow(),
                 )
                 t0 = time.perf_counter()
+                rec = self._manifest.get(job_id, {})
                 resume_post_only = (
                     self.args.resume
-                    and self._job_status(job_id) == "ik_done"
                     and os.path.isfile(raw_path)
+                    and (
+                        self._job_status(job_id) == "ik_done"
+                        or (
+                            self._job_status(job_id) == "post_done"
+                            and self.args.no_filter
+                            and int(rec.get("n_pass", 0)) == 0
+                        )
+                    )
                 )
 
                 try:
@@ -256,6 +270,7 @@ class BatchRunner:
                         raw_path,
                         batch_root=self.root,
                         thresholds=thresholds,
+                        no_filter=self.args.no_filter,
                         event_cb=event_cb,
                     )
                     stats["clips_pass"] += post["n_pass"]
@@ -330,6 +345,8 @@ def main():
     ap.add_argument("--force", action="store_true", help="覆盖 runner.lock")
     ap.add_argument("--no-refine", action="store_true")
     ap.add_argument("--preview", action="store_true", help="每个 job 通过后生成 PNG 预览")
+    ap.add_argument("--no-filter", action="store_true",
+                    help="跳过后处理质量筛选，全部生成 obs NPZ（仍会记录 metrics）")
     ap.add_argument("--err-mean-mm", type=float, default=15.0)
     ap.add_argument("--ok-ratio", type=float, default=0.85)
     ap.add_argument("--max-droll", type=float, default=0.12)

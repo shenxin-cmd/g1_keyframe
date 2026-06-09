@@ -157,6 +157,7 @@ def process_raw_trajectory(
     batch_root: str = DEFAULT_BATCH_ROOT,
     thresholds: FilterThresholds | None = None,
     save_clips_raw: bool = False,
+    no_filter: bool = False,
     event_cb=None,
 ) -> dict[str, Any]:
     """
@@ -196,46 +197,42 @@ def process_raw_trajectory(
     }
     clip_records: list[dict] = []
 
+    metrics: dict[str, Any] = {}
+    filter_reasons: list[str] = []
     if n_frames != frames_per_ring:
-        reason = f"bad_frame_count={n_frames}!={frames_per_ring}"
-        rej_path = os.path.join(dirs["rejected"], f"{base}.reject.json")
-        with open(rej_path, "w", encoding="utf-8") as f:
-            json.dump({**payload_base, "reasons": [reason]}, f, indent=2)
-        if event_cb:
-            event_cb("traj_rejected", {**payload_base, "reasons": [reason]})
-        clip_records.append({**payload_base, "status": "rejected", "reasons": [reason]})
-        return {
-            "raw_path": raw_path,
-            "shape": shape,
-            "seed": seed,
-            "n_clips": 1,
-            "n_pass": 0,
-            "n_reject": 1,
-            "clips": clip_records,
-        }
-
-    ok, metrics, reasons = assess_clip(qpos, waypoints, locked_branch, thresholds)
-    if not ok:
-        rej_path = os.path.join(dirs["rejected"], f"{base}.reject.json")
-        with open(rej_path, "w", encoding="utf-8") as f:
-            json.dump({
+        filter_reasons.append(f"bad_frame_count={n_frames}!={frames_per_ring}")
+    else:
+        ok, metrics, filter_reasons = assess_clip(qpos, waypoints, locked_branch, thresholds)
+        if not ok and not no_filter:
+            rej_path = os.path.join(dirs["rejected"], f"{base}.reject.json")
+            with open(rej_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    **payload_base,
+                    "metrics": metrics,
+                    "thresholds": asdict(thresholds),
+                    "reasons": filter_reasons,
+                }, f, indent=2)
+            clip_records.append({
                 **payload_base,
+                "status": "rejected",
+                "reasons": filter_reasons,
                 "metrics": metrics,
-                "thresholds": asdict(thresholds),
-                "reasons": reasons,
-            }, f, indent=2)
-        clip_records.append({**payload_base, "status": "rejected", "reasons": reasons, "metrics": metrics})
-        if event_cb:
-            event_cb("traj_rejected", {**payload_base, "reasons": reasons, "metrics": metrics})
-        return {
-            "raw_path": raw_path,
-            "shape": shape,
-            "seed": seed,
-            "n_clips": 1,
-            "n_pass": 0,
-            "n_reject": 1,
-            "clips": clip_records,
-        }
+            })
+            if event_cb:
+                event_cb("traj_rejected", {
+                    **payload_base,
+                    "reasons": filter_reasons,
+                    "metrics": metrics,
+                })
+            return {
+                "raw_path": raw_path,
+                "shape": shape,
+                "seed": seed,
+                "n_clips": 1,
+                "n_pass": 0,
+                "n_reject": 1,
+                "clips": clip_records,
+            }
 
     shape_dir_obs = os.path.join(dirs["clips_obs"], shape)
     os.makedirs(shape_dir_obs, exist_ok=True)
@@ -277,6 +274,9 @@ def process_raw_trajectory(
         "metrics": metrics,
         "obs_clip_path": obs_path,
     }
+    if no_filter and filter_reasons:
+        rec["filter_skipped"] = True
+        rec["would_reject_reasons"] = filter_reasons
     clip_records.append(rec)
     if event_cb:
         event_cb("traj_passed", rec)

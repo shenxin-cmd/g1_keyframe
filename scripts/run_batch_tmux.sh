@@ -16,9 +16,11 @@ fi
 
 CMD="cd '$REPO' && \
   source \"\$(conda info --base)/etc/profile.d/conda.sh\" && \
-  conda activate g1-traj-dev && \
+  conda activate key && \
   export G1_BATCH_ROOT='$BATCH_ROOT' && \
-  python g1_batch_runner.py --resume --force --layers 1 --frames-per-ring 300 --seed-count 100 --batch-root '$BATCH_ROOT' 2>&1 | tee -a '$BATCH_ROOT/logs/run.log'"
+  python g1_batch_runner.py --resume --force --no-filter --layers 1 --frames-per-ring 300 --seed-count 100 --batch-root '$BATCH_ROOT' 2>&1 | tee -a '$BATCH_ROOT/logs/run.log'; \
+  echo ''; echo '[g1_batch] 批量任务已结束。窗口保持打开，exit 可关闭。'; \
+  exec bash"
 
 tmux new-session -d -s "$SESSION" bash -lc "$CMD"
 echo "已启动 tmux 会话: $SESSION"
