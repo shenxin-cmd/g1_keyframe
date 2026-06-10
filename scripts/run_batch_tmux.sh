@@ -2,9 +2,13 @@
 # 在 tmux 中启动 G1 批量轨迹采集（可 resume）
 set -euo pipefail
 
-SESSION="${G1_BATCH_SESSION:-g1_batch}"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-BATCH_ROOT="${G1_BATCH_ROOT:-$REPO/batch_data}"
+# 形状平面：yz(默认) | xy | xz。不同平面默认写入独立目录，避免互相覆盖。
+# 例: G1_SHAPE_PLANE=xy bash scripts/run_batch_tmux.sh
+SHAPE_PLANE="${G1_SHAPE_PLANE:-yz}"
+# 未指定 G1_BATCH_ROOT 时：batch_data_yz / batch_data_xy / batch_data_xz
+BATCH_ROOT="${G1_BATCH_ROOT:-$REPO/batch_data_${SHAPE_PLANE}}"
+SESSION="${G1_BATCH_SESSION:-g1_batch_${SHAPE_PLANE}}"
 
 mkdir -p "$BATCH_ROOT/logs"
 
@@ -18,8 +22,6 @@ fi
 # 例: G1_BATCH_WORKERS=8 bash scripts/run_batch_tmux.sh
 WORKERS="${G1_BATCH_WORKERS:-$(( $(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) - 1 ))}"
 if [ "$WORKERS" -lt 1 ]; then WORKERS=1; fi
-# 形状平面：yz(默认) | xy | xz。例: G1_SHAPE_PLANE=xy bash scripts/run_batch_tmux.sh
-SHAPE_PLANE="${G1_SHAPE_PLANE:-yz}"
 # 可选快速 IK（略降精度）：G1_FAST_IK=1 bash scripts/run_batch_tmux.sh
 FAST_IK_FLAG=""
 if [ "${G1_FAST_IK:-0}" = "1" ]; then FAST_IK_FLAG="--fast-ik"; fi
@@ -33,9 +35,10 @@ CMD="cd '$REPO' && \
   exec bash"
 
 tmux new-session -d -s "$SESSION" bash -lc "$CMD"
-echo "已启动 tmux 会话: $SESSION (plane=$SHAPE_PLANE, workers=$WORKERS${G1_FAST_IK:+", fast-ik"})"
+echo "已启动 tmux 会话: $SESSION"
+echo "  平面=$SHAPE_PLANE | workers=$WORKERS | 数据目录=$BATCH_ROOT${G1_FAST_IK:+, fast-ik}"
 echo "查看: tmux attach -t $SESSION"
 echo "日志: tail -f $BATCH_ROOT/logs/run.log"
-echo "调并行度: G1_BATCH_WORKERS=4 bash scripts/run_batch_tmux.sh"
-echo "换平面: G1_SHAPE_PLANE=xy bash scripts/run_batch_tmux.sh"
-echo "要快速 IK: G1_FAST_IK=1 bash scripts/run_batch_tmux.sh"
+echo "调并行度: G1_BATCH_WORKERS=64 bash scripts/run_batch_tmux.sh"
+echo "换平面:   G1_SHAPE_PLANE=xy bash scripts/run_batch_tmux.sh  -> batch_data_xy/"
+echo "自定义目录: G1_BATCH_ROOT=/path/to/data G1_SHAPE_PLANE=xy bash scripts/run_batch_tmux.sh"
