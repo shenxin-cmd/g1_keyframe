@@ -1198,7 +1198,15 @@ def main():
 
     if args.preview and last_traj is not None:
         from g1_multi_shape_traj_gen import preview_trajectory
-        preview_trajectory(last_traj["qpos"], last_traj["waypoints"], MODEL_PATH)
+        preview_trajectory(
+            {
+                "qpos": last_traj["qpos"],
+                "qvel": last_traj["qvel"],
+                "timestamps": last_traj["timestamps"],
+                "waypoints": last_traj["waypoints"],
+            },
+            fps=args.fps,
+        )
 
 
 if __name__ == "__main__":
