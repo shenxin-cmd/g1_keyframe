@@ -49,6 +49,7 @@ from g1_multi_shape_traj_gen import (
 from g1_multi_shape_traj_gen import IKSolver4DOF as _IKSolver4DOF
 from g1_right_hand_workspace import (
     CENTER_SAMPLE_INSET,
+    TRAJ_BOUNDARY_MARGIN,
     DEFAULT_FRONT_X_MAX,
     DEFAULT_FRONT_X_MIN,
     ROBOT_XML,
@@ -61,13 +62,14 @@ from g1_right_hand_workspace import (
     _reset_to_home,
     build_reachable_workspace,
     envelope_margins_at,
+    inset_bounds,
     load_workspace_cache,
     sample_center_from_cloud,
 )
 
 os.makedirs("recordings", exist_ok=True)
 
-DEFAULT_FPS = 50.0
+DEFAULT_FPS = 30.0
 DEFAULT_FRAMES_PER_RING = 200
 DEFAULT_TRANSITION_FRAMES = 15
 DEFAULT_LAYERS = 5
@@ -117,13 +119,13 @@ def sample_center(
 
 
 def _waypoints_fit_workspace(shape_wps, ee_cloud, ws: ReachableWorkspace,
-                             prox: float = WS_PROXIMITY * 1.06) -> bool:
+                             prox: float = WS_PROXIMITY * 1.06,
+                             boundary_margin: float = TRAJ_BOUNDARY_MARGIN) -> bool:
     diff = shape_wps[:, None, :] - ee_cloud[None, :, :]
     dmax = float(np.linalg.norm(diff, axis=2).min(axis=1).max())
     if dmax > prox:
         return False
-    lo = ws.lo - 0.006
-    hi = ws.hi + 0.006
+    lo, hi = inset_bounds(ws.lo, ws.hi, boundary_margin)
     return bool((shape_wps >= lo).all() and (shape_wps <= hi).all())
 
 
@@ -135,7 +137,7 @@ def find_max_scale(
     ee_cloud: np.ndarray,
     rng: np.random.Generator,
     probe_frames: int = 64,
-    margin: float = 0.012,
+    margin: float = TRAJ_BOUNDARY_MARGIN,
 ) -> tuple[float, float]:
     """
     先由 x 切片 yz 边界估算上界，再以 1cm 步长向下搜索最大可画 scale。

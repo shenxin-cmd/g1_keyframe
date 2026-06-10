@@ -58,6 +58,7 @@ from typing import Sequence
 import mujoco
 import numpy as np
 from scipy.optimize import least_squares, minimize
+from scipy.spatial import cKDTree
 
 from g1_arm_posture import (
     ELBOW_BRANCH_AUTO,
@@ -109,6 +110,8 @@ DIST_BLEND = 0.55         # TRAC-IK Distance：连续性权重（防解支跳变
 ROLL_BLEND = 0.35
 MAX_ROLL_STEP = 0.10
 SQP_MAXITER = 45
+FAST_SQP_MAXITER = 22
+FAST_WS_NEIGHBOR_K = 4
 
 # q4 顺序：pitch(0), roll(1), yaw(2), elbow(3)
 IDX_PITCH, IDX_ROLL, IDX_YAW, IDX_ELBOW = 0, 1, 2, 3
@@ -138,6 +141,24 @@ class IkResult:
     col_ratio: float
     locked_branch: str | None
     branch_violations: int
+
+
+class WorkspaceIndex:
+    """可达域点云 KD-tree，加速近邻关节种子查询。"""
+
+    def __init__(self, ee_cloud: np.ndarray, joint_configs: np.ndarray):
+        self.ee_cloud = np.asarray(ee_cloud, dtype=np.float64)
+        self.joint_configs = np.asarray(joint_configs, dtype=np.float64)
+        self.tree = cKDTree(self.ee_cloud)
+
+    def nearest_indices(self, target: np.ndarray, k: int = 24) -> np.ndarray:
+        k = min(int(k), len(self.ee_cloud))
+        if k <= 0:
+            return np.array([], dtype=int)
+        dist, idx = self.tree.query(np.asarray(target, dtype=np.float64).reshape(3), k=k)
+        if k == 1:
+            return np.array([int(idx)], dtype=int)
+        return np.asarray(idx, dtype=int).reshape(-1)
 
 
 class G1RightArmModel:
@@ -347,12 +368,21 @@ class TracIkStyleSolver:
     参考 TRACLabs TRAC-IK (KDL Newton + SQP 并行) 与 MoveIt kinematics。
     """
 
-    def __init__(self, arm: G1RightArmModel, arm_ids, obstacle_ids):
+    def __init__(
+        self,
+        arm: G1RightArmModel,
+        arm_ids,
+        obstacle_ids,
+        sqp_maxiter: int = SQP_MAXITER,
+        ws_neighbor_k: int = WS_NEIGHBOR_K,
+    ):
         self.arm = arm
         self.arm_ids = arm_ids
         self.obstacle_ids = obstacle_ids
         self._lo = arm.ranges[:, 0].copy()
         self._hi = arm.ranges[:, 1].copy()
+        self.sqp_maxiter = int(sqp_maxiter)
+        self.ws_neighbor_k = int(ws_neighbor_k)
 
     def _optimize_from_seed(
         self,
@@ -386,7 +416,8 @@ class TracIkStyleSolver:
             bounds = list(zip(self._lo.tolist(), self._hi.tolist()))
         res = minimize(
             objective, q_seed, method="L-BFGS-B",
-            bounds=bounds, options={"maxiter": SQP_MAXITER, "ftol": 1e-9},
+            bounds=bounds,
+            options={"maxiter": self.sqp_maxiter, "ftol": 1e-9},
         )
         q_best = self.arm.clip_q4(res.x)
         self.arm.set_q4(q_best)
@@ -399,10 +430,15 @@ class TracIkStyleSolver:
         ee_cloud: np.ndarray,
         joint_configs: np.ndarray,
         locked_branch: str | None,
-        k: int = WS_NEIGHBOR_K,
+        k: int | None = None,
+        ws_index: WorkspaceIndex | None = None,
     ) -> list[np.ndarray]:
-        dist = np.linalg.norm(ee_cloud - target, axis=1)
-        order = np.argsort(dist)[:max(k, 24)]
+        k = self.ws_neighbor_k if k is None else k
+        if ws_index is not None:
+            order = ws_index.nearest_indices(target, k=max(k, 24))
+        else:
+            dist = np.linalg.norm(ee_cloud - target, axis=1)
+            order = np.argsort(dist)[:max(k, 24)]
         seeds = []
         for c in order:
             q4 = joint_configs[c]
@@ -424,6 +460,7 @@ class TracIkStyleSolver:
         joint_configs: np.ndarray,
         locked_branch: str | None,
         tol: float = POS_TOL,
+        ws_index: WorkspaceIndex | None = None,
     ) -> tuple[np.ndarray, float, bool]:
         seeds: list[np.ndarray] = []
         if q_prev is not None:
@@ -431,7 +468,7 @@ class TracIkStyleSolver:
             # 人类化逐步限位下，只在 q_{i-1} 邻域内搜索；多种子易选到不可达支路
         else:
             seeds.extend(self._workspace_seeds(
-                target, ee_cloud, joint_configs, locked_branch, k=WS_NEIGHBOR_K,
+                target, ee_cloud, joint_configs, locked_branch, ws_index=ws_index,
             ))
             if not seeds:
                 seeds.append(self.arm.clip_q4(q_ref))
@@ -460,7 +497,7 @@ class TracIkStyleSolver:
             if best_bounded[0] > POS_TOL * 4:
                 fallback_seeds = [self.arm.clip_q4(q_prev)]
                 fallback_seeds.extend(self._workspace_seeds(
-                    target, ee_cloud, joint_configs, locked_branch, k=WS_NEIGHBOR_K,
+                    target, ee_cloud, joint_configs, locked_branch, ws_index=ws_index,
                 ))
                 fb_uniq: list[np.ndarray] = []
                 for s in fallback_seeds:
@@ -664,6 +701,7 @@ class TrajectoryIKSolver:
         self,
         model: mujoco.MjModel | None = None,
         data: mujoco.MjData | None = None,
+        fast_ik: bool = False,
     ):
         self.model = model or mujoco.MjModel.from_xml_path(ROBOT_XML)
         self.data = data or mujoco.MjData(self.model)
@@ -672,7 +710,12 @@ class TrajectoryIKSolver:
             self.model, _OBSTACLE_BODY_NAMES_MINIMAL,
             ee_body_names=_RIGHT_ARM_COLLISION_BODY_NAMES,
         )
-        self.trac_ik = TracIkStyleSolver(self.arm, self.arm_ids, self.obstacle_ids)
+        sqp_maxiter = FAST_SQP_MAXITER if fast_ik else SQP_MAXITER
+        ws_k = FAST_WS_NEIGHBOR_K if fast_ik else WS_NEIGHBOR_K
+        self.trac_ik = TracIkStyleSolver(
+            self.arm, self.arm_ids, self.obstacle_ids,
+            sqp_maxiter=sqp_maxiter, ws_neighbor_k=ws_k,
+        )
         self.tp_ik = TaskPriorityDlsIk(self.arm)
         self.addr = self.arm.addr
 
@@ -682,9 +725,13 @@ class TrajectoryIKSolver:
         ee_cloud: np.ndarray,
         joint_configs: np.ndarray,
         locked_branch: str | None,
+        ws_index: WorkspaceIndex | None = None,
     ) -> np.ndarray:
-        dist = np.linalg.norm(ee_cloud - waypoint0, axis=1)
-        order = np.argsort(dist)[:64]
+        if ws_index is not None:
+            order = ws_index.nearest_indices(waypoint0, k=64)
+        else:
+            dist = np.linalg.norm(ee_cloud - waypoint0, axis=1)
+            order = np.argsort(dist)[:64]
         for c in order:
             q4 = joint_configs[c]
             if locked_branch and not is_allowed_q4(
@@ -706,11 +753,15 @@ class TrajectoryIKSolver:
         ee_cloud: np.ndarray,
         joint_configs: np.ndarray,
         branch_mode: str,
+        ws_index: WorkspaceIndex | None = None,
     ) -> str | None:
         if branch_mode in (ELBOW_BRANCH_INWARD, ELBOW_BRANCH_OUTWARD):
             return branch_mode
-        dist = np.linalg.norm(ee_cloud - waypoint0, axis=1)
-        c0 = np.argsort(dist)[:48]
+        if ws_index is not None:
+            c0 = ws_index.nearest_indices(waypoint0, k=48)
+        else:
+            dist = np.linalg.norm(ee_cloud - waypoint0, axis=1)
+            c0 = np.argsort(dist)[:48]
         return pick_locked_branch_from_candidates(
             joint_configs, c0, branch_mode,
             self.model, self.data, self.addr,
@@ -721,7 +772,7 @@ class TrajectoryIKSolver:
         waypoints: np.ndarray,
         ee_cloud: np.ndarray | None = None,
         joint_configs: np.ndarray | None = None,
-        fps: float = 50.0,
+        fps: float = 30.0,
         elbow_branch_mode: str = ELBOW_BRANCH_AUTO,
         locked_branch: str | None = None,
         closed_path: bool = True,
@@ -732,9 +783,11 @@ class TrajectoryIKSolver:
         n = len(waypoints)
         if ee_cloud is None or joint_configs is None:
             raise ValueError("需提供 ee_cloud 与 joint_configs（TRAC-IK 多种子）")
+        ws_index = WorkspaceIndex(ee_cloud, joint_configs)
         if locked_branch is None:
             locked_branch = self._resolve_locked_branch(
                 waypoints[0], ee_cloud, joint_configs, elbow_branch_mode,
+                ws_index=ws_index,
             )
             if locked_branch is None:
                 raise RuntimeError("无法确定肘部折向")
@@ -743,6 +796,7 @@ class TrajectoryIKSolver:
         if ee_cloud is not None and joint_configs is not None:
             q_prev = self._pick_initial_q4(
                 waypoints[0], ee_cloud, joint_configs, locked_branch,
+                ws_index=ws_index,
             )
         else:
             q_prev = _branch_reference_q4(locked_branch)
@@ -757,6 +811,7 @@ class TrajectoryIKSolver:
                 waypoints[i],
                 q_prev if i > 0 else None,
                 q_ref, ee_cloud, joint_configs, locked_branch,
+                ws_index=ws_index,
             )
             self.arm.set_q4(q_i)
             col_flags[i] = _has_penetration(
@@ -816,7 +871,7 @@ def solve_trajectory_ik(
     waypoints: np.ndarray,
     ee_cloud: np.ndarray,
     joint_configs: np.ndarray,
-    fps: float = 50.0,
+    fps: float = 30.0,
     elbow_branch_mode: str = ELBOW_BRANCH_AUTO,
     locked_branch: str | None = None,
     closed_path: bool = True,
@@ -841,15 +896,25 @@ def solve_trajectory_ik(
     )
 
 
+_EVAL_CTX: tuple[mujoco.MjModel, mujoco.MjData, G1RightArmModel] | None = None
+
+
+def _get_eval_ctx() -> tuple[mujoco.MjModel, mujoco.MjData, G1RightArmModel]:
+    global _EVAL_CTX
+    if _EVAL_CTX is None:
+        model = mujoco.MjModel.from_xml_path(ROBOT_XML)
+        data = mujoco.MjData(model)
+        _EVAL_CTX = (model, data, G1RightArmModel(model, data))
+    return _EVAL_CTX
+
+
 def evaluate_trajectory(
     qpos: np.ndarray,
     waypoints: np.ndarray,
     locked_branch: str | None = None,
 ) -> dict:
     """评估末端误差、折向违规、X 抖动。"""
-    model = mujoco.MjModel.from_xml_path(ROBOT_XML)
-    data = mujoco.MjData(model)
-    arm = G1RightArmModel(model, data)
+    model, data, arm = _get_eval_ctx()
     ee_id = arm.ee_id
     n = min(len(qpos), len(waypoints))
     ee_pts = np.zeros((n, 3))
@@ -901,6 +966,7 @@ def _generate_concentric_demo(
     joints,
     ws,
     refine: bool,
+    fast_ik: bool = False,
 ) -> dict:
     from g1_concentric_traj_gen import (
         build_concentric_scales,
@@ -912,7 +978,7 @@ def _generate_concentric_demo(
     scales = build_concentric_scales(scale_max, n_layers)
     rings = build_concentric_waypoints(shape, center, scales, theta, frames_per_ring, rng)
 
-    solver = TrajectoryIKSolver()
+    solver = TrajectoryIKSolver(fast_ik=fast_ik)
     all_qpos, all_qvel, all_ts, all_wps = [], [], [], []
     segment_starts = [0]
     layer_metrics: list[dict] = []
@@ -1029,6 +1095,7 @@ def _try_generate_concentric_demo(
     center: np.ndarray | None = None,
     theta: float | None = None,
     max_tries: int = 12,
+    fast_ik: bool = False,
 ) -> dict | None:
     from g1_concentric_traj_gen import sample_center
 
@@ -1042,6 +1109,7 @@ def _try_generate_concentric_demo(
             return _generate_concentric_demo(
                 shape, c, n_layers, fps, frames_per_ring,
                 elbow_branch_mode, rng, th, ee, joints, ws, refine,
+                fast_ik=fast_ik,
             )
         except RuntimeError:
             if center is not None:
@@ -1060,7 +1128,7 @@ def main():
                     help="生成多少条轨迹（每次随机采样不同中心/朝向）")
     ap.add_argument("--theta", type=float, default=None, help="形状旋转角（弧度）；不指定则随机")
     ap.add_argument("--seed", type=int, default=None, help="随机种子（可复现）")
-    ap.add_argument("--fps", type=float, default=50.0)
+    ap.add_argument("--fps", type=float, default=30.0)
     ap.add_argument("--frames-per-ring", type=int, default=200)
     ap.add_argument("--elbow-branch", default="outward")
     ap.add_argument("--ws-cache", action="store_true")

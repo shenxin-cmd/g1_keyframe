@@ -5,8 +5,10 @@ G1 批量轨迹采集主控：多形状 × 随机采样 → 单圈 300 帧 IK �
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import logging
+import multiprocessing as mp
 import os
 import signal
 import sys
@@ -46,6 +48,118 @@ BATCH_SHAPES = [
 ]
 
 # center=None 时从可达域随机采样圆心
+
+_WORKER_STATE: dict[str, Any] = {}
+
+
+@dataclasses.dataclass
+class WorkerConfig:
+    batch_root: str
+    layers: int
+    frames_per_ring: int
+    fps: float
+    no_refine: bool
+    no_filter: bool
+    fast_ik: bool
+    center: list[float] | None
+    err_mean_mm: float
+    ok_ratio: float
+    max_droll: float
+    max_dpitch: float
+    max_dyaw: float
+    xflip: int
+
+
+def _worker_init(cfg_dict: dict) -> None:
+    """子进程初始化：各 worker 独立加载可行域与 MuJoCo 上下文。"""
+    global _WORKER_STATE
+    cfg = WorkerConfig(**cfg_dict)
+    ee, joints, ws = _load_reachable_workspace(True)
+    _WORKER_STATE = {
+        "cfg": cfg,
+        "ee": ee,
+        "joints": joints,
+        "ws": ws,
+        "thresholds": FilterThresholds(
+            err_mean_mm=cfg.err_mean_mm,
+            ok_ratio=cfg.ok_ratio,
+            max_droll=cfg.max_droll,
+            max_dpitch=cfg.max_dpitch,
+            max_dyaw=cfg.max_dyaw,
+            xflip=cfg.xflip,
+        ),
+    }
+
+
+def _worker_run_job(task: dict) -> dict:
+    """在子进程中执行单个 job（IK + 后处理）。"""
+    cfg: WorkerConfig = _WORKER_STATE["cfg"]
+    ee = _WORKER_STATE["ee"]
+    joints = _WORKER_STATE["joints"]
+    ws = _WORKER_STATE["ws"]
+    thresholds: FilterThresholds = _WORKER_STATE["thresholds"]
+
+    job_id = task["job_id"]
+    shape = task["shape"]
+    seed = task["seed"]
+    raw_path = task["raw_path"]
+    resume_post_only = task["resume_post_only"]
+    t0 = time.perf_counter()
+    ik_sec = 0.0
+
+    try:
+        if not resume_post_only:
+            rng = np.random.default_rng(seed)
+            center_arg = (
+                np.array(cfg.center, dtype=np.float64)
+                if cfg.center is not None else None
+            )
+            traj = _try_generate_concentric_demo(
+                shape,
+                cfg.layers,
+                cfg.fps,
+                cfg.frames_per_ring,
+                ELBOW_BRANCH_OUTWARD,
+                ee, joints, ws,
+                rng,
+                refine=not cfg.no_refine,
+                center=center_arg,
+                theta=None,
+                fast_ik=cfg.fast_ik,
+            )
+            if traj is None:
+                raise RuntimeError("IK 失败：中心不可行")
+            os.makedirs(os.path.dirname(raw_path) or ".", exist_ok=True)
+            save_trajectory_npz(raw_path, traj, seed=seed)
+            ik_sec = time.perf_counter() - t0
+
+        post = process_raw_trajectory(
+            raw_path,
+            batch_root=cfg.batch_root,
+            thresholds=thresholds,
+            no_filter=cfg.no_filter,
+            event_cb=None,
+        )
+        return {
+            "job_id": job_id,
+            "shape": shape,
+            "seed": seed,
+            "status": "ok",
+            "ik_sec": ik_sec,
+            "resume_post_only": resume_post_only,
+            "post": post,
+            "raw_path": raw_path,
+        }
+    except Exception as exc:
+        return {
+            "job_id": job_id,
+            "shape": shape,
+            "seed": seed,
+            "status": "failed",
+            "ik_sec": time.perf_counter() - t0,
+            "error": str(exc),
+            "raw_path": raw_path,
+        }
 
 
 class BatchRunner:
@@ -172,6 +286,280 @@ class BatchRunner:
             jobs = jobs[: self.args.max_jobs]
         return jobs
 
+    def _worker_config_dict(self) -> dict:
+        center = None
+        if self.args.center is not None:
+            center = self.args.center.tolist()
+        return dataclasses.asdict(WorkerConfig(
+            batch_root=self.root,
+            layers=self.args.layers,
+            frames_per_ring=self.args.frames_per_ring,
+            fps=self.args.fps,
+            no_refine=self.args.no_refine,
+            no_filter=self.args.no_filter,
+            fast_ik=self.args.fast_ik,
+            center=center,
+            err_mean_mm=self.args.err_mean_mm,
+            ok_ratio=self.args.ok_ratio,
+            max_droll=self.args.max_droll,
+            max_dpitch=self.args.max_dpitch,
+            max_dyaw=self.args.max_dyaw,
+            xflip=self.args.max_xflip,
+        ))
+
+    def _resume_post_only(self, job_id: str, raw_path: str) -> bool:
+        rec = self._manifest.get(job_id, {})
+        return (
+            self.args.resume
+            and os.path.isfile(raw_path)
+            and (
+                self._job_status(job_id) == "ik_done"
+                or (
+                    self._job_status(job_id) == "post_done"
+                    and self.args.no_filter
+                    and int(rec.get("n_pass", 0)) == 0
+                )
+            )
+        )
+
+    def _process_job_result(
+        self,
+        ji: int,
+        total: int,
+        result: dict,
+        stats: dict[str, int],
+    ) -> None:
+        job_id = result["job_id"]
+        if result["status"] == "failed":
+            stats["failed"] += 1
+            self._update_manifest(
+                job_id,
+                status="failed",
+                error=result.get("error", "unknown"),
+                finished_at=self._utcnow(),
+            )
+            self._emit_event("ik_failed", {
+                "job_id": job_id,
+                "error": result.get("error", "unknown"),
+            })
+            self.logger.error(
+                "[%d/%d] %s 失败: %s",
+                ji + 1, total, job_id, result.get("error", "unknown"),
+            )
+            return
+
+        post = result["post"]
+        ik_sec = float(result.get("ik_sec", 0.0))
+        raw_path = result["raw_path"]
+        if not result.get("resume_post_only"):
+            self._emit_event("ik_done", {
+                "job_id": job_id,
+                "raw_path": raw_path,
+                "sec": ik_sec,
+            })
+            self._update_manifest(
+                job_id,
+                status="ik_done",
+                raw_path=raw_path,
+                ik_sec=ik_sec,
+            )
+
+        stats["clips_pass"] += post["n_pass"]
+        stats["clips_reject"] += post["n_reject"]
+        if self.args.preview:
+            from g1_clip_inspector import inspect_clip_file
+            for clip in post["clips"]:
+                obs_path = clip.get("obs_clip_path")
+                if clip.get("status") != "passed" or not obs_path:
+                    continue
+                try:
+                    inspect_clip_file(obs_path, self.root)
+                except Exception as e:
+                    self.logger.warning("预览失败 %s: %s", obs_path, e)
+
+        self._update_manifest(
+            job_id,
+            status="post_done",
+            n_clips=post["n_clips"],
+            n_pass=post["n_pass"],
+            n_reject=post["n_reject"],
+            finished_at=self._utcnow(),
+        )
+        self._write_checkpoint(job_id)
+        stats["done"] += 1
+        status = "PASS" if post["n_pass"] else "REJECT"
+        self.logger.info(
+            "[%d/%d] %s IK %.1fs | %s | 累计 pass=%d reject=%d failed=%d",
+            ji + 1, total, job_id, ik_sec, status,
+            stats["clips_pass"], stats["clips_reject"], stats["failed"],
+        )
+
+    def _run_serial(self, jobs: list[tuple[str, int]], thresholds: FilterThresholds,
+                    ee, joints, ws) -> dict[str, int]:
+        stats = {"done": 0, "failed": 0, "skipped": 0, "clips_pass": 0, "clips_reject": 0}
+        for ji, (shape, seed) in enumerate(jobs):
+            job_id = self._job_id(shape, seed)
+            raw_path = self._raw_path(shape, seed)
+            if self._should_skip(job_id):
+                stats["skipped"] += 1
+                self.logger.info("[%d/%d] 跳过已完成 %s", ji + 1, len(jobs), job_id)
+                continue
+
+            self._current_job = job_id
+            self._update_manifest(
+                job_id,
+                shape=shape,
+                seed=seed,
+                status="running",
+                started_at=self._utcnow(),
+            )
+            t0 = time.perf_counter()
+            resume_post_only = self._resume_post_only(job_id, raw_path)
+
+            try:
+                if resume_post_only:
+                    self.logger.info(
+                        "[%d/%d] %s 续跑后处理（跳过 IK）", ji + 1, len(jobs), job_id,
+                    )
+                    ik_sec = 0.0
+                    result = {
+                        "job_id": job_id,
+                        "shape": shape,
+                        "seed": seed,
+                        "status": "ok",
+                        "ik_sec": ik_sec,
+                        "resume_post_only": True,
+                        "raw_path": raw_path,
+                        "post": process_raw_trajectory(
+                            raw_path,
+                            batch_root=self.root,
+                            thresholds=thresholds,
+                            no_filter=self.args.no_filter,
+                            event_cb=lambda evt, payload, jid=job_id: self._emit_event(
+                                evt, {"job_id": jid, **payload},
+                            ),
+                        ),
+                    }
+                else:
+                    self._emit_event("ik_start", {
+                        "job_id": job_id, "shape": shape, "seed": seed,
+                    })
+                    rng = np.random.default_rng(seed)
+                    center_arg = (
+                        self.args.center.copy()
+                        if self.args.center is not None else None
+                    )
+                    traj = _try_generate_concentric_demo(
+                        shape,
+                        self.args.layers,
+                        self.args.fps,
+                        self.args.frames_per_ring,
+                        ELBOW_BRANCH_OUTWARD,
+                        ee, joints, ws,
+                        rng,
+                        refine=not self.args.no_refine,
+                        center=center_arg,
+                        theta=None,
+                        fast_ik=self.args.fast_ik,
+                    )
+                    if traj is None:
+                        raise RuntimeError("IK 失败：中心不可行")
+                    os.makedirs(os.path.dirname(raw_path) or ".", exist_ok=True)
+                    save_trajectory_npz(raw_path, traj, seed=seed)
+                    ik_sec = time.perf_counter() - t0
+                    self._emit_event("ik_done", {
+                        "job_id": job_id, "raw_path": raw_path, "sec": ik_sec,
+                    })
+                    self._update_manifest(
+                        job_id, status="ik_done", raw_path=raw_path, ik_sec=ik_sec,
+                    )
+                    result = {
+                        "job_id": job_id,
+                        "shape": shape,
+                        "seed": seed,
+                        "status": "ok",
+                        "ik_sec": ik_sec,
+                        "resume_post_only": False,
+                        "raw_path": raw_path,
+                        "post": process_raw_trajectory(
+                            raw_path,
+                            batch_root=self.root,
+                            thresholds=thresholds,
+                            no_filter=self.args.no_filter,
+                            event_cb=lambda evt, payload, jid=job_id: self._emit_event(
+                                evt, {"job_id": jid, **payload},
+                            ),
+                        ),
+                    }
+                self._process_job_result(ji, len(jobs), result, stats)
+            except Exception as e:
+                stats["failed"] += 1
+                self._update_manifest(
+                    job_id,
+                    status="failed",
+                    error=str(e),
+                    finished_at=self._utcnow(),
+                )
+                self._emit_event("ik_failed", {"job_id": job_id, "error": str(e)})
+                self.logger.exception(
+                    "[%d/%d] %s 失败: %s", ji + 1, len(jobs), job_id, e,
+                )
+            self._current_job = None
+        return stats
+
+    def _run_parallel(self, jobs: list[tuple[str, int]]) -> dict[str, int]:
+        stats = {"done": 0, "failed": 0, "skipped": 0, "clips_pass": 0, "clips_reject": 0}
+        pending: list[tuple[int, dict]] = []
+        for ji, (shape, seed) in enumerate(jobs):
+            job_id = self._job_id(shape, seed)
+            raw_path = self._raw_path(shape, seed)
+            if self._should_skip(job_id):
+                stats["skipped"] += 1
+                self.logger.info("[%d/%d] 跳过已完成 %s", ji + 1, len(jobs), job_id)
+                continue
+            self._update_manifest(
+                job_id,
+                shape=shape,
+                seed=seed,
+                status="queued",
+                started_at=self._utcnow(),
+            )
+            pending.append((ji, {
+                "job_index": ji,
+                "job_id": job_id,
+                "shape": shape,
+                "seed": seed,
+                "raw_path": raw_path,
+                "resume_post_only": self._resume_post_only(job_id, raw_path),
+            }))
+
+        if not pending:
+            return stats
+
+        workers = min(self.args.workers, len(pending))
+        self.logger.info("并行执行 %d 个待处理 job，workers=%d", len(pending), workers)
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(
+            processes=workers,
+            initializer=_worker_init,
+            initargs=(self._worker_config_dict(),),
+        ) as pool:
+            tasks = [task for _, task in pending]
+            index_by_job = {task["job_id"]: ji for ji, task in pending}
+            for result in pool.imap_unordered(_worker_run_job, tasks):
+                job_id = result["job_id"]
+                ji = index_by_job[job_id]
+                self._current_job = job_id
+                if result["status"] == "ok" and not result.get("resume_post_only"):
+                    self._emit_event("ik_start", {
+                        "job_id": job_id,
+                        "shape": result["shape"],
+                        "seed": result["seed"],
+                    })
+                self._process_job_result(ji, len(jobs), result, stats)
+                self._current_job = None
+        return stats
+
     def run(self) -> None:
         if not os.path.isfile(WS_CACHE_PATH):
             raise RuntimeError(f"缺少可行域缓存 {WS_CACHE_PATH}，请先运行 g1_right_hand_workspace.py")
@@ -181,14 +569,20 @@ class BatchRunner:
         center_desc = (
             self.args.center.tolist() if self.args.center is not None else "随机采样"
         )
+        fast_note = " | fast-ik" if self.args.fast_ik else ""
+        worker_note = (
+            f" | workers={self.args.workers}"
+            if self.args.workers > 1 else " | workers=1(串行)"
+        )
         self.logger.info(
-            "开始批量任务: %d jobs | center=%s layers=%d F=%d fps=%.0f%s",
+            "开始批量任务: %d jobs | center=%s layers=%d F=%d fps=%.0f%s%s%s",
             len(jobs), center_desc, self.args.layers,
             self.args.frames_per_ring, self.args.fps,
             " | 筛选已关闭(--no-filter)" if self.args.no_filter else "",
+            worker_note,
+            fast_note,
         )
 
-        ee, joints, ws = _load_reachable_workspace(True)
         thresholds = FilterThresholds(
             err_mean_mm=self.args.err_mean_mm,
             ok_ratio=self.args.ok_ratio,
@@ -201,121 +595,11 @@ class BatchRunner:
         stats = {"done": 0, "failed": 0, "skipped": 0, "clips_pass": 0, "clips_reject": 0}
 
         try:
-            for ji, (shape, seed) in enumerate(jobs):
-                job_id = self._job_id(shape, seed)
-                raw_path = self._raw_path(shape, seed)
-                if self._should_skip(job_id):
-                    stats["skipped"] += 1
-                    self.logger.info("[%d/%d] 跳过已完成 %s", ji + 1, len(jobs), job_id)
-                    continue
-
-                self._current_job = job_id
-                self._update_manifest(
-                    job_id,
-                    shape=shape,
-                    seed=seed,
-                    status="running",
-                    started_at=self._utcnow(),
-                )
-                t0 = time.perf_counter()
-                rec = self._manifest.get(job_id, {})
-                resume_post_only = (
-                    self.args.resume
-                    and os.path.isfile(raw_path)
-                    and (
-                        self._job_status(job_id) == "ik_done"
-                        or (
-                            self._job_status(job_id) == "post_done"
-                            and self.args.no_filter
-                            and int(rec.get("n_pass", 0)) == 0
-                        )
-                    )
-                )
-
-                try:
-                    if resume_post_only:
-                        self.logger.info("[%d/%d] %s 续跑后处理（跳过 IK）", ji + 1, len(jobs), job_id)
-                        ik_sec = 0.0
-                    else:
-                        self._emit_event("ik_start", {"job_id": job_id, "shape": shape, "seed": seed})
-                        rng = np.random.default_rng(seed)
-                        center_arg = (
-                            self.args.center.copy()
-                            if self.args.center is not None else None
-                        )
-                        traj = _try_generate_concentric_demo(
-                            shape,
-                            self.args.layers,
-                            self.args.fps,
-                            self.args.frames_per_ring,
-                            ELBOW_BRANCH_OUTWARD,
-                            ee, joints, ws,
-                            rng,
-                            refine=not self.args.no_refine,
-                            center=center_arg,
-                            theta=None,
-                        )
-                        if traj is None:
-                            raise RuntimeError("IK 失败：中心不可行")
-
-                        save_trajectory_npz(raw_path, traj, seed=seed)
-                        ik_sec = time.perf_counter() - t0
-                        self._emit_event("ik_done", {"job_id": job_id, "raw_path": raw_path, "sec": ik_sec})
-                        self._update_manifest(job_id, status="ik_done", raw_path=raw_path, ik_sec=ik_sec)
-
-                    def event_cb(evt_type: str, payload: dict):
-                        self._emit_event(evt_type, {"job_id": job_id, **payload})
-
-                    post = process_raw_trajectory(
-                        raw_path,
-                        batch_root=self.root,
-                        thresholds=thresholds,
-                        no_filter=self.args.no_filter,
-                        event_cb=event_cb,
-                    )
-                    stats["clips_pass"] += post["n_pass"]
-                    stats["clips_reject"] += post["n_reject"]
-
-                    if self.args.preview:
-                        from g1_clip_inspector import inspect_clip_file
-                        for clip in post["clips"]:
-                            obs_path = clip.get("obs_clip_path")
-                            if clip.get("status") != "passed" or not obs_path:
-                                continue
-                            try:
-                                inspect_clip_file(obs_path, self.root)
-                            except Exception as e:
-                                self.logger.warning("预览失败 %s: %s", obs_path, e)
-
-                    self._update_manifest(
-                        job_id,
-                        status="post_done",
-                        n_clips=post["n_clips"],
-                        n_pass=post["n_pass"],
-                        n_reject=post["n_reject"],
-                        finished_at=self._utcnow(),
-                    )
-                    self._write_checkpoint(job_id)
-                    stats["done"] += 1
-                    status = "PASS" if post["n_pass"] else "REJECT"
-                    self.logger.info(
-                        "[%d/%d] %s IK %.1fs | %s | 累计 pass=%d reject=%d failed=%d",
-                        ji + 1, len(jobs), job_id, ik_sec, status,
-                        stats["clips_pass"], stats["clips_reject"], stats["failed"],
-                    )
-
-                except Exception as e:
-                    stats["failed"] += 1
-                    self._update_manifest(
-                        job_id,
-                        status="failed",
-                        error=str(e),
-                        finished_at=self._utcnow(),
-                    )
-                    self._emit_event("ik_failed", {"job_id": job_id, "error": str(e)})
-                    self.logger.exception("[%d/%d] %s 失败: %s", ji + 1, len(jobs), job_id, e)
-
-                self._current_job = None
+            if self.args.workers > 1:
+                stats = self._run_parallel(jobs)
+            else:
+                ee, joints, ws = _load_reachable_workspace(True)
+                stats = self._run_serial(jobs, thresholds, ee, joints, ws)
 
         finally:
             self._release_lock()
@@ -336,7 +620,8 @@ def main():
     ap.add_argument("--layers", type=int, default=1,
                     help="每条轨迹圈数（默认 1 圈 = 300 帧）")
     ap.add_argument("--frames-per-ring", type=int, default=300)
-    ap.add_argument("--fps", type=float, default=50.0)
+    ap.add_argument("--fps", type=float, default=30.0,
+                    help="轨迹采样/回放帧率（帧数仍由 --frames-per-ring 决定）")
     ap.add_argument("--seed-start", type=int, default=0)
     ap.add_argument("--seed-count", type=int, default=100,
                     help="每种形状随机采样次数")
@@ -344,6 +629,14 @@ def main():
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--force", action="store_true", help="覆盖 runner.lock")
     ap.add_argument("--no-refine", action="store_true")
+    ap.add_argument(
+        "--workers", type=int, default=1,
+        help="并行 worker 数（MuJoCo IK 为 CPU 任务，建议设为 CPU 核数-1）",
+    )
+    ap.add_argument(
+        "--fast-ik", action="store_true",
+        help="批量快速 IK：减少 SQP 迭代与种子数（略降精度，显著提速）",
+    )
     ap.add_argument("--preview", action="store_true", help="每个 job 通过后生成 PNG 预览")
     ap.add_argument("--no-filter", action="store_true",
                     help="跳过后处理质量筛选，全部生成 obs NPZ（仍会记录 metrics）")

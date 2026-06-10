@@ -39,6 +39,7 @@ from g1_arm_posture import (
 from g1_multi_shapes import SHAPE_NAMES, make_shape_local, make_shape_waypoints
 from g1_right_hand_workspace import (
     CENTER_SAMPLE_INSET,
+    TRAJ_BOUNDARY_MARGIN,
     DEFAULT_FRONT_X_MAX,
     DEFAULT_FRONT_X_MIN,
     ROBOT_XML,
@@ -301,7 +302,8 @@ def _yz_extents_at_theta(local_yz, theta):
     return float(dy.max()), float(dz.max())
 
 
-def compute_safe_scale(center, theta, shape_name, plan, ws, rng, margin=0.012):
+def compute_safe_scale(center, theta, shape_name, plan, ws, rng,
+                       margin: float = TRAJ_BOUNDARY_MARGIN):
     """
     用 x 切片 yz 边界估算中心处最大 scale，再在大/小比例区间内随机采样。
     """
@@ -324,9 +326,9 @@ def compute_safe_scale(center, theta, shape_name, plan, ws, rng, margin=0.012):
     return scale, scale_max, frac
 
 
-def waypoints_in_reachable_box(waypoints, ws: ReachableWorkspace, margin=0.006):
-    lo = ws.lo - margin
-    hi = ws.hi + margin
+def waypoints_in_reachable_box(waypoints, ws: ReachableWorkspace,
+                               margin: float = TRAJ_BOUNDARY_MARGIN):
+    lo, hi = inset_bounds(ws.lo, ws.hi, margin)
     return bool((waypoints >= lo).all() and (waypoints <= hi).all())
 
 

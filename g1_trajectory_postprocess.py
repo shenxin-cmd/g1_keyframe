@@ -62,6 +62,28 @@ def traj_basename(
     )
 
 
+_EVAL_ARM: G1RightArmModel | None = None
+_OBS_CTX: tuple[mujoco.MjModel, mujoco.MjData, PrivilegedStateComputer] | None = None
+
+
+def _get_eval_arm() -> G1RightArmModel:
+    global _EVAL_ARM
+    if _EVAL_ARM is None:
+        model = mujoco.MjModel.from_xml_path(ROBOT_XML)
+        _EVAL_ARM = G1RightArmModel(model)
+    return _EVAL_ARM
+
+
+def _get_obs_ctx() -> tuple[mujoco.MjModel, mujoco.MjData, PrivilegedStateComputer]:
+    global _OBS_CTX
+    if _OBS_CTX is None:
+        model = mujoco.MjModel.from_xml_path(MODEL_PATH)
+        data = mujoco.MjData(model)
+        priv = PrivilegedStateComputer(model, dt=PRIV_STATE_DT)
+        _OBS_CTX = (model, data, priv)
+    return _OBS_CTX
+
+
 def _right_arm_joint_steps(qpos_seg: np.ndarray, arm: G1RightArmModel) -> dict[str, float]:
     q4 = np.array(
         [[qpos_seg[i, a] for a in arm.qpos_addrs] for i in range(len(qpos_seg))],
@@ -84,9 +106,7 @@ def assess_clip(
     thresholds: FilterThresholds,
 ) -> tuple[bool, dict[str, Any], list[str]]:
     metrics = evaluate_trajectory(qpos_seg, wps_seg, locked_branch)
-    model = mujoco.MjModel.from_xml_path(ROBOT_XML)
-    arm = G1RightArmModel(model)
-    metrics.update(_right_arm_joint_steps(qpos_seg, arm))
+    metrics.update(_right_arm_joint_steps(qpos_seg, _get_eval_arm()))
 
     reasons: list[str] = []
     if metrics["err_mean_mm"] > thresholds.err_mean_mm:
@@ -108,9 +128,7 @@ def assess_clip(
 
 
 def qpos_to_obs(qpos_arr: np.ndarray, qvel_arr: np.ndarray, fps: float) -> dict[str, np.ndarray]:
-    model = mujoco.MjModel.from_xml_path(MODEL_PATH)
-    data = mujoco.MjData(model)
-    priv = PrivilegedStateComputer(model, dt=PRIV_STATE_DT)
+    model, data, priv = _get_obs_ctx()
     priv.reset()
 
     n = len(qpos_arr)
@@ -178,7 +196,7 @@ def process_raw_trajectory(
         locked_branch = None
 
     seed = int(data["seed"]) if "seed" in data else -1
-    fps = float(data["fps"]) if "fps" in data else 50.0
+    fps = float(data["fps"]) if "fps" in data else 30.0
     frames_per_ring = int(data["frames_per_ring"]) if "frames_per_ring" in data else 300
     if "layer_scales" in data and len(data["layer_scales"]) > 0:
         scale = float(data["layer_scales"][0])

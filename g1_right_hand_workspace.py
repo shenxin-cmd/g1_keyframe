@@ -80,7 +80,9 @@ HOME_PELVIS_QUAT = np.array([1.0, 0.0, 0.0, 0.0])
 DEFAULT_FRONT_X_MIN = 0.05
 DEFAULT_FRONT_X_MAX = 0.55
 # 轨迹中心随机采样时，相对可达域边界 xyz 各向内缩进（避免伸直难动区域）
-CENTER_SAMPLE_INSET = 0.10
+CENTER_SAMPLE_INSET = 0.20
+# 形状轨迹路点相对可达域边界（x 切片 yz 包络或轴对齐盒）至少保留的安全距离
+TRAJ_BOUNDARY_MARGIN = 0.10
 PENETRATION_THRESH = -0.0005
 PROBE_OK_DIST = 0.045
 
@@ -228,8 +230,8 @@ def envelope_bounds_at(envelope: WorkspaceEnvelope, x: float):
 
 
 def envelope_margins_at(envelope: WorkspaceEnvelope, center: np.ndarray,
-                        margin: float = 0.012):
-    """中心点到当前 x 切片 yz 边界的最近余量 (my, mz)。"""
+                        margin: float = TRAJ_BOUNDARY_MARGIN):
+    """中心点到当前 x 切片 yz 边界的最近余量 (my, mz)，已扣除 margin。"""
     y_lo, y_hi, z_lo, z_hi = envelope_bounds_at(envelope, float(center[0]))
     cy, cz = float(center[1]), float(center[2])
     my = min(cy - y_lo, y_hi - cy) - margin
