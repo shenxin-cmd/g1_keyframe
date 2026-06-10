@@ -20,6 +20,7 @@ import numpy as np
 
 from g1_arm_posture import ELBOW_BRANCH_OUTWARD
 from g1_concentric_traj_gen import resolve_shape_name
+from g1_multi_shapes import DEFAULT_SHAPE_PLANE, resolve_shape_plane
 from g1_right_hand_workspace import WS_CACHE_PATH
 from g1_trajectory_ik import (
     _load_reachable_workspace,
@@ -61,6 +62,7 @@ class WorkerConfig:
     no_refine: bool
     no_filter: bool
     fast_ik: bool
+    shape_plane: str
     center: list[float] | None
     err_mean_mm: float
     ok_ratio: float
@@ -126,6 +128,7 @@ def _worker_run_job(task: dict) -> dict:
                 center=center_arg,
                 theta=None,
                 fast_ik=cfg.fast_ik,
+                shape_plane=cfg.shape_plane,
             )
             if traj is None:
                 raise RuntimeError("IK 失败：中心不可行")
@@ -255,13 +258,16 @@ class BatchRunner:
             os.remove(self.lock_path)
 
     def _job_id(self, shape: str, seed: int) -> str:
+        plane = self.args.shape_plane
         if self.args.center is not None:
-            return f"{shape}_{format_center_tag(self.args.center)}_seed{seed:03d}"
-        return f"{shape}_seed{seed:03d}"
+            return f"{shape}_{plane}_{format_center_tag(self.args.center)}_seed{seed:03d}"
+        return f"{shape}_{plane}_seed{seed:03d}"
 
     def _raw_path(self, shape: str, seed: int) -> str:
         fname = f"seed{seed:03d}_L{self.args.layers}_F{self.args.frames_per_ring}.npz"
-        return os.path.join(self.dirs["raw"], shape, fname)
+        return os.path.join(
+            self.dirs["raw"], shape, self.args.shape_plane, fname,
+        )
 
     def _job_status(self, job_id: str) -> str | None:
         rec = self._manifest.get(job_id)
@@ -298,6 +304,7 @@ class BatchRunner:
             no_refine=self.args.no_refine,
             no_filter=self.args.no_filter,
             fast_ik=self.args.fast_ik,
+            shape_plane=self.args.shape_plane,
             center=center,
             err_mean_mm=self.args.err_mean_mm,
             ok_ratio=self.args.ok_ratio,
@@ -461,6 +468,7 @@ class BatchRunner:
                         center=center_arg,
                         theta=None,
                         fast_ik=self.args.fast_ik,
+                        shape_plane=self.args.shape_plane,
                     )
                     if traj is None:
                         raise RuntimeError("IK 失败：中心不可行")
@@ -575,8 +583,8 @@ class BatchRunner:
             if self.args.workers > 1 else " | workers=1(串行)"
         )
         self.logger.info(
-            "开始批量任务: %d jobs | center=%s layers=%d F=%d fps=%.0f%s%s%s",
-            len(jobs), center_desc, self.args.layers,
+            "开始批量任务: %d jobs | plane=%s | center=%s layers=%d F=%d fps=%.0f%s%s%s",
+            len(jobs), self.args.shape_plane, center_desc, self.args.layers,
             self.args.frames_per_ring, self.args.fps,
             " | 筛选已关闭(--no-filter)" if self.args.no_filter else "",
             worker_note,
@@ -637,6 +645,10 @@ def main():
         "--fast-ik", action="store_true",
         help="批量快速 IK：减少 SQP 迭代与种子数（略降精度，显著提速）",
     )
+    ap.add_argument(
+        "--shape-plane", type=str, default=DEFAULT_SHAPE_PLANE,
+        help="形状所在平面: yz(默认,垂直于x) | xy(水平) | xz",
+    )
     ap.add_argument("--preview", action="store_true", help="每个 job 通过后生成 PNG 预览")
     ap.add_argument("--no-filter", action="store_true",
                     help="跳过后处理质量筛选，全部生成 obs NPZ（仍会记录 metrics）")
@@ -650,6 +662,7 @@ def main():
     args.center = (
         np.array(args.center, dtype=np.float64) if args.center is not None else None
     )
+    args.shape_plane = resolve_shape_plane(args.shape_plane)
 
     BatchRunner(args).run()
 

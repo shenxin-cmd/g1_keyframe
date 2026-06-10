@@ -19,6 +19,7 @@ from g1_player import (
     PrivilegedStateComputer,
     compute_state,
 )
+from g1_multi_shapes import DEFAULT_SHAPE_PLANE
 from g1_trajectory_ik import G1RightArmModel, ROBOT_XML, evaluate_trajectory
 
 DEFAULT_BATCH_ROOT = os.environ.get("G1_BATCH_ROOT", "batch_data")
@@ -54,10 +55,11 @@ def traj_basename(
     scale: float,
     seed: int,
     frames: int = 300,
+    shape_plane: str = DEFAULT_SHAPE_PLANE,
 ) -> str:
-    """单圈轨迹命名：形状 + 圆心 + 半径 + seed + 帧数"""
+    """单圈轨迹命名：形状 + 平面 + 圆心 + 半径 + seed + 帧数"""
     return (
-        f"{shape}_{format_center_tag(center)}_s{scale:.3f}"
+        f"{shape}_P{shape_plane}_{format_center_tag(center)}_s{scale:.3f}"
         f"_seed{seed:03d}_F{frames}"
     )
 
@@ -198,15 +200,22 @@ def process_raw_trajectory(
     seed = int(data["seed"]) if "seed" in data else -1
     fps = float(data["fps"]) if "fps" in data else 30.0
     frames_per_ring = int(data["frames_per_ring"]) if "frames_per_ring" in data else 300
+    if "shape_plane" in data:
+        shape_plane = str(np.asarray(data["shape_plane"]).reshape(-1)[0])
+    else:
+        shape_plane = DEFAULT_SHAPE_PLANE
     if "layer_scales" in data and len(data["layer_scales"]) > 0:
         scale = float(data["layer_scales"][0])
     else:
         scale = float(data["scale_max"]) if "scale_max" in data else 0.0
 
     n_frames = len(qpos)
-    base = traj_basename(shape, center, scale, seed, frames_per_ring)
+    base = traj_basename(
+        shape, center, scale, seed, frames_per_ring, shape_plane=shape_plane,
+    )
     payload_base = {
         "shape": shape,
+        "shape_plane": shape_plane,
         "seed": seed,
         "scale": scale,
         "center": center.tolist(),
@@ -252,12 +261,12 @@ def process_raw_trajectory(
                 "clips": clip_records,
             }
 
-    shape_dir_obs = os.path.join(dirs["clips_obs"], shape)
+    shape_dir_obs = os.path.join(dirs["clips_obs"], shape, shape_plane)
     os.makedirs(shape_dir_obs, exist_ok=True)
     obs_path = os.path.join(shape_dir_obs, f"{base}_obs.npz")
 
     if save_clips_raw:
-        shape_dir_raw = os.path.join(dirs["clips_raw"], shape)
+        shape_dir_raw = os.path.join(dirs["clips_raw"], shape, shape_plane)
         os.makedirs(shape_dir_raw, exist_ok=True)
         raw_out = os.path.join(shape_dir_raw, f"{base}_raw.npz")
         _atomic_save_npz(
@@ -277,6 +286,7 @@ def process_raw_trajectory(
     obs = qpos_to_obs(qpos, qvel, fps)
     obs.update(
         shape_name=shape,
+        shape_plane=np.array(shape_plane),
         center=center.astype(np.float32),
         scale=np.float32(scale),
         seed=np.int32(seed),

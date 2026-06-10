@@ -1,11 +1,35 @@
 """
 G1 右手多形状轨迹 — 闭合路径参数化库
-所有形状在局部 (y, z) 平面生成，再映射到世界坐标 (x, y, z)。
+形状在局部 2D 平面生成，再映射到世界坐标 (x, y, z)。
+
+支持平面（shape_plane）：
+  - yz：形状在 y-z 平面，x 固定在中心（默认，与原行为一致）
+  - xy：形状在 x-y 平面，z 固定在中心
+  - xz：形状在 x-z 平面，y 固定在中心
 """
 
 from __future__ import annotations
 
 import numpy as np
+
+SHAPE_PLANES = ("yz", "xy", "xz")
+DEFAULT_SHAPE_PLANE = "yz"
+
+_PLANE_ALIASES: dict[str, str] = {
+    "yz": "yz", "y-z": "yz", "yz_plane": "yz", "垂直yz": "yz",
+    "xy": "xy", "x-y": "xy", "xy_plane": "xy", "水平xy": "xy",
+    "xz": "xz", "x-z": "xz", "xz_plane": "xz",
+}
+
+
+def resolve_shape_plane(name: str) -> str:
+    key = name.strip().lower().replace(" ", "")
+    if key in _PLANE_ALIASES:
+        return _PLANE_ALIASES[key]
+    if key in SHAPE_PLANES:
+        return key
+    opts = ", ".join(SHAPE_PLANES)
+    raise ValueError(f"未知 shape_plane: {name}，可选: {opts}")
 
 SHAPE_NAMES = [
     "circle",
@@ -39,15 +63,88 @@ CONCENTRIC_SHAPE_NAMES = [
 ]
 
 
+def plane_extents_at_theta(local_uv: np.ndarray, theta: float) -> tuple[float, float]:
+    """局部单位形状经旋转 theta 后，在两个活动轴上的最大半宽（与平面无关）。"""
+    c, s = np.cos(theta), np.sin(theta)
+    ul, vl = local_uv[:, 0], local_uv[:, 1]
+    ext_u = float(np.abs(ul * c - vl * s).max())
+    ext_v = float(np.abs(ul * s + vl * c).max())
+    return ext_u, ext_v
+
+
+def plane_margins_at(
+    center: np.ndarray,
+    ws,
+    plane: str = DEFAULT_SHAPE_PLANE,
+    margin: float = 0.10,
+) -> tuple[float, float]:
+    """
+    中心点在指定平面内可扩张的最大半宽（扣除 margin）。
+    返回 (沿第一活动轴, 沿第二活动轴) 的余量。
+    """
+    from g1_right_hand_workspace import (
+        TRAJ_BOUNDARY_MARGIN,
+        envelope_margins_at,
+    )
+    plane = resolve_shape_plane(plane)
+    margin = float(margin if margin is not None else TRAJ_BOUNDARY_MARGIN)
+    c = np.asarray(center, dtype=np.float64).reshape(3)
+    lo = np.asarray(ws.lo, dtype=np.float64)
+    hi = np.asarray(ws.hi, dtype=np.float64)
+
+    if plane == "yz":
+        if getattr(ws, "envelope", None) is not None:
+            return envelope_margins_at(ws.envelope, c, margin=margin)
+        cy, cz = float(c[1]), float(c[2])
+        ma = min(cy - lo[1], hi[1] - cy) - margin
+        mb = min(cz - lo[2], hi[2] - cz) - margin
+        return float(ma), float(mb)
+    if plane == "xy":
+        cx, cy = float(c[0]), float(c[1])
+        ma = min(cx - lo[0], hi[0] - cx) - margin
+        mb = min(cy - lo[1], hi[1] - cy) - margin
+        return float(ma), float(mb)
+    # xz
+    cx, cz = float(c[0]), float(c[2])
+    ma = min(cx - lo[0], hi[0] - cx) - margin
+    mb = min(cz - lo[2], hi[2] - cz) - margin
+    return float(ma), float(mb)
+
+
+def _local_to_world(
+    local_uv: np.ndarray,
+    center: np.ndarray,
+    scale: float,
+    theta: float,
+    plane: str = DEFAULT_SHAPE_PLANE,
+) -> np.ndarray:
+    plane = resolve_shape_plane(plane)
+    c, s = np.cos(theta), np.sin(theta)
+    ul = local_uv[:, 0]
+    vl = local_uv[:, 1]
+    a = ul * c - vl * s
+    b = ul * s + vl * c
+    center = np.asarray(center, dtype=np.float64).reshape(3)
+    n = len(local_uv)
+    if plane == "yz":
+        x = np.full(n, center[0], dtype=np.float64)
+        y = center[1] + scale * a
+        z = center[2] + scale * b
+    elif plane == "xy":
+        x = center[0] + scale * a
+        y = center[1] + scale * b
+        z = np.full(n, center[2], dtype=np.float64)
+    else:  # xz
+        x = center[0] + scale * a
+        y = np.full(n, center[1], dtype=np.float64)
+        z = center[2] + scale * b
+    return np.stack([x, y, z], axis=1).astype(np.float32)
+
+
 def _to_world(local_yz: np.ndarray, center: np.ndarray, scale: float,
               theta: float) -> np.ndarray:
-    c, s = np.cos(theta), np.sin(theta)
-    yl = local_yz[:, 0]
-    zl = local_yz[:, 1]
-    y = center[1] + scale * (yl * c - zl * s)
-    z = center[2] + scale * (yl * s + zl * c)
-    x = np.full(len(local_yz), center[0], dtype=np.float64)
-    return np.stack([x, y, z], axis=1).astype(np.float32)
+    """兼容旧接口：等价于 plane='yz'。"""
+    return _local_to_world(local_yz, center, scale, theta, plane="yz")
 
 
 def _resample_polyline(pts: list, N: int) -> np.ndarray:
@@ -245,9 +342,13 @@ def make_shape_waypoints(
     theta: float,
     N: int = 250,
     rng: np.random.Generator | None = None,
+    plane: str = DEFAULT_SHAPE_PLANE,
     **kwargs,
 ) -> np.ndarray:
     if rng is None:
         rng = np.random.default_rng()
     local = make_shape_local(shape_name, N, rng)
-    return _to_world(local, np.asarray(center, dtype=np.float64), scale, theta)
+    return _local_to_world(
+        local, np.asarray(center, dtype=np.float64), scale, theta,
+        plane=plane,
+    )

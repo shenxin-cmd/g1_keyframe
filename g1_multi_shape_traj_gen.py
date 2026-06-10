@@ -36,7 +36,15 @@ from g1_arm_posture import (
     q4_branch_stable_with_anchor,
     resolve_branch_mode,
 )
-from g1_multi_shapes import SHAPE_NAMES, make_shape_local, make_shape_waypoints
+from g1_multi_shapes import (
+    DEFAULT_SHAPE_PLANE,
+    SHAPE_NAMES,
+    make_shape_local,
+    make_shape_waypoints,
+    plane_extents_at_theta,
+    plane_margins_at,
+    resolve_shape_plane,
+)
 from g1_right_hand_workspace import (
     CENTER_SAMPLE_INSET,
     TRAJ_BOUNDARY_MARGIN,
@@ -52,7 +60,6 @@ from g1_right_hand_workspace import (
     _has_penetration,
     _reset_to_home,
     build_reachable_workspace,
-    envelope_margins_at,
     inset_bounds,
     load_workspace_cache,
     mask_points_in_box,
@@ -294,30 +301,19 @@ def pick_center_in_region(ee_cloud, ws, plan, rng,
     return pool[best].copy()
 
 
-def _yz_extents_at_theta(local_yz, theta):
-    c, s = np.cos(theta), np.sin(theta)
-    yl, zl = local_yz[:, 0], local_yz[:, 1]
-    dy = np.abs(yl * c - zl * s)
-    dz = np.abs(yl * s + zl * c)
-    return float(dy.max()), float(dz.max())
-
-
 def compute_safe_scale(center, theta, shape_name, plan, ws, rng,
-                       margin: float = TRAJ_BOUNDARY_MARGIN):
+                       margin: float = TRAJ_BOUNDARY_MARGIN,
+                       plane: str = DEFAULT_SHAPE_PLANE):
     """
-    用 x 切片 yz 边界估算中心处最大 scale，再在大/小比例区间内随机采样。
+    用可达域边界估算中心处最大 scale，再在大/小比例区间内随机采样。
     """
+    plane = resolve_shape_plane(plane)
     local = make_shape_local(shape_name, 48, rng)
-    ext_y, ext_z = _yz_extents_at_theta(local, theta)
-    ext_y = max(ext_y, 1e-6)
-    ext_z = max(ext_z, 1e-6)
-    if ws.envelope is not None:
-        my, mz = envelope_margins_at(ws.envelope, center, margin=margin)
-    else:
-        cy, cz = float(center[1]), float(center[2])
-        my = min(cy - ws.lo[1], ws.hi[1] - cy) - margin
-        mz = min(cz - ws.lo[2], ws.hi[2] - cz) - margin
-    scale_max = min(my / ext_y, mz / ext_z)
+    ext_a, ext_b = plane_extents_at_theta(local, theta)
+    ext_a = max(ext_a, 1e-6)
+    ext_b = max(ext_b, 1e-6)
+    ma, mb = plane_margins_at(center, ws, plane=plane, margin=margin)
+    scale_max = min(ma / ext_a, mb / ext_b)
     scale_max = float(max(SCALE_MIN, scale_max))
     frac_lo, frac_hi = (SCALE_LARGE_FRAC_OF_MAX if plan["large"]
                         else SCALE_SMALL_FRAC_OF_MAX)
@@ -336,7 +332,8 @@ def fit_shape_waypoints_to_workspace(shape, center, scale, theta,
                                      frames_per_shape, ee_cloud, rng,
                                      ws: ReachableWorkspace,
                                      scale_max: float | None = None,
-                                     min_scale: float = SCALE_MIN):
+                                     min_scale: float = SCALE_MIN,
+                                     plane: str = DEFAULT_SHAPE_PLANE):
     """边界采样为主；若仍略超可行域则每次减 1cm。"""
     scale = float(scale)
     floor = float(min_scale)
@@ -346,7 +343,8 @@ def fit_shape_waypoints_to_workspace(shape, center, scale, theta,
     last_dmax = 0.0
     while scale >= floor - 1e-9:
         shape_wps = make_shape_waypoints(
-            shape, center, scale, theta, N=frames_per_shape, rng=rng
+            shape, center, scale, theta, N=frames_per_shape, rng=rng,
+            plane=plane,
         )
         diff = shape_wps[:, None, :] - ee_cloud[None, :, :]
         dmin = np.linalg.norm(diff, axis=2).min(axis=1)

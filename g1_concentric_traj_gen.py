@@ -28,7 +28,15 @@ import time
 import mujoco
 import numpy as np
 
-from g1_multi_shapes import CONCENTRIC_SHAPE_NAMES, make_shape_local, make_shape_waypoints
+from g1_multi_shapes import (
+    CONCENTRIC_SHAPE_NAMES,
+    DEFAULT_SHAPE_PLANE,
+    make_shape_local,
+    make_shape_waypoints,
+    plane_extents_at_theta,
+    plane_margins_at,
+    resolve_shape_plane,
+)
 from g1_arm_posture import ELBOW_BRANCH_AUTO, resolve_branch_mode
 from g1_multi_shape_traj_gen import (
     ACTIVE_JOINTS,
@@ -61,7 +69,6 @@ from g1_right_hand_workspace import (
     _build_collision_id_sets,
     _reset_to_home,
     build_reachable_workspace,
-    envelope_margins_at,
     inset_bounds,
     load_workspace_cache,
     sample_center_from_cloud,
@@ -103,12 +110,6 @@ def resolve_shape_name(name: str) -> str:
     raise ValueError(f"未知形状: {name}，可选: {opts}")
 
 
-def _yz_extents_at_theta(local_yz, theta: float):
-    c, s = np.cos(theta), np.sin(theta)
-    yl, zl = local_yz[:, 0], local_yz[:, 1]
-    return float(np.abs(yl * c - zl * s).max()), float(np.abs(yl * s + zl * c).max())
-
-
 def sample_center(
     ee_cloud: np.ndarray,
     ws: ReachableWorkspace,
@@ -138,27 +139,24 @@ def find_max_scale(
     rng: np.random.Generator,
     probe_frames: int = 64,
     margin: float = TRAJ_BOUNDARY_MARGIN,
+    plane: str = DEFAULT_SHAPE_PLANE,
 ) -> tuple[float, float]:
     """
-    先由 x 切片 yz 边界估算上界，再以 1cm 步长向下搜索最大可画 scale。
+    由可达域边界估算上界，再以 1cm 步长向下搜索最大可画 scale。
     返回 (scale_envelope, scale_fit)。
     """
+    plane = resolve_shape_plane(plane)
     local = make_shape_local(shape, probe_frames, rng)
-    ext_y, ext_z = _yz_extents_at_theta(local, theta)
-    ext_y = max(ext_y, 1e-6)
-    ext_z = max(ext_z, 1e-6)
-    if ws.envelope is not None:
-        my, mz = envelope_margins_at(ws.envelope, center, margin=margin)
-    else:
-        cy, cz = float(center[1]), float(center[2])
-        my = min(cy - ws.lo[1], ws.hi[1] - cy) - margin
-        mz = min(cz - ws.lo[2], ws.hi[2] - cz) - margin
-    scale_env = float(max(SCALE_MIN, min(my / ext_y, mz / ext_z) * 0.98))
+    ext_a, ext_b = plane_extents_at_theta(local, theta)
+    ext_a = max(ext_a, 1e-6)
+    ext_b = max(ext_b, 1e-6)
+    ma, mb = plane_margins_at(center, ws, plane=plane, margin=margin)
+    scale_env = float(max(SCALE_MIN, min(ma / ext_a, mb / ext_b) * 0.98))
     scale = scale_env
     scale_fit = SCALE_MIN
     while scale >= SCALE_MIN - 1e-9:
         wps = make_shape_waypoints(
-            shape, center, scale, theta, N=probe_frames, rng=rng,
+            shape, center, scale, theta, N=probe_frames, rng=rng, plane=plane,
         )
         if _waypoints_fit_workspace(wps, ee_cloud, ws):
             scale_fit = float(scale)
@@ -211,11 +209,14 @@ def build_concentric_waypoints(
     theta: float,
     frames_per_ring: int,
     rng: np.random.Generator,
+    plane: str = DEFAULT_SHAPE_PLANE,
 ) -> list[np.ndarray]:
+    plane = resolve_shape_plane(plane)
     rings = []
     for sc in scales:
         rings.append(make_shape_waypoints(
             shape, center, float(sc), theta, N=frames_per_ring, rng=rng,
+            plane=plane,
         ))
     return rings
 

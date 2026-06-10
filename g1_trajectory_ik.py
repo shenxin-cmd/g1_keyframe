@@ -70,7 +70,7 @@ from g1_arm_posture import (
     pick_locked_branch_from_candidates,
     resolve_branch_mode,
 )
-from g1_multi_shapes import make_shape_waypoints
+from g1_multi_shapes import DEFAULT_SHAPE_PLANE, make_shape_waypoints, resolve_shape_plane
 from g1_right_hand_workspace import (
     ACTIVE_JOINTS,
     LOCKED_JOINTS,
@@ -967,6 +967,7 @@ def _generate_concentric_demo(
     ws,
     refine: bool,
     fast_ik: bool = False,
+    shape_plane: str = DEFAULT_SHAPE_PLANE,
 ) -> dict:
     from g1_concentric_traj_gen import (
         build_concentric_scales,
@@ -974,9 +975,14 @@ def _generate_concentric_demo(
         find_max_scale,
     )
 
-    scale_env, scale_max = find_max_scale(shape, center, theta, ws, ee, rng)
+    shape_plane = resolve_shape_plane(shape_plane)
+    scale_env, scale_max = find_max_scale(
+        shape, center, theta, ws, ee, rng, plane=shape_plane,
+    )
     scales = build_concentric_scales(scale_max, n_layers)
-    rings = build_concentric_waypoints(shape, center, scales, theta, frames_per_ring, rng)
+    rings = build_concentric_waypoints(
+        shape, center, scales, theta, frames_per_ring, rng, plane=shape_plane,
+    )
 
     solver = TrajectoryIKSolver(fast_ik=fast_ik)
     all_qpos, all_qvel, all_ts, all_wps = [], [], [], []
@@ -987,7 +993,8 @@ def _generate_concentric_demo(
     dt = 1.0 / fps
 
     print(f"中心=({center[0]:.2f},{center[1]:.2f},{center[2]:.2f}) "
-          f"theta={theta:.2f} scale_max={scale_max:.3f} 层数={len(scales)}")
+          f"plane={shape_plane} theta={theta:.2f} scale_max={scale_max:.3f} "
+          f"层数={len(scales)}")
 
     for li, ring_wps in enumerate(rings):
         print(f"  层 {li+1}/{len(scales)} IK (TrajectoryIKSolver) ...", flush=True)
@@ -1037,6 +1044,7 @@ def _generate_concentric_demo(
         "frames_per_ring": int(frames_per_ring),
         "n_layers": int(len(scales)),
         "locked_branch": locked,
+        "shape_plane": shape_plane,
     }
 
 
@@ -1061,6 +1069,8 @@ def save_trajectory_npz(path: str, traj: dict, seed: int | None = None) -> None:
         locked_branch=traj["locked_branch"],
         ik_method="trac_ik_human",
     )
+    if "shape_plane" in traj:
+        payload["shape_plane"] = np.array(str(traj["shape_plane"]))
     if seed is not None:
         payload["seed"] = np.int32(seed)
     metrics = traj.get("layer_metrics")
@@ -1096,9 +1106,11 @@ def _try_generate_concentric_demo(
     theta: float | None = None,
     max_tries: int = 12,
     fast_ik: bool = False,
+    shape_plane: str = DEFAULT_SHAPE_PLANE,
 ) -> dict | None:
     from g1_concentric_traj_gen import sample_center
 
+    shape_plane = resolve_shape_plane(shape_plane)
     for attempt in range(max_tries):
         if center is not None and attempt == 0:
             c = center.copy()
@@ -1109,7 +1121,7 @@ def _try_generate_concentric_demo(
             return _generate_concentric_demo(
                 shape, c, n_layers, fps, frames_per_ring,
                 elbow_branch_mode, rng, th, ee, joints, ws, refine,
-                fast_ik=fast_ik,
+                fast_ik=fast_ik, shape_plane=shape_plane,
             )
         except RuntimeError:
             if center is not None:
@@ -1133,6 +1145,10 @@ def main():
     ap.add_argument("--elbow-branch", default="outward")
     ap.add_argument("--ws-cache", action="store_true")
     ap.add_argument("--no-refine", action="store_true", help="跳过全轨迹 Gauss-Newton")
+    ap.add_argument(
+        "--shape-plane", type=str, default=DEFAULT_SHAPE_PLANE,
+        help="形状平面: yz | xy | xz",
+    )
     ap.add_argument("--preview", action="store_true")
     ap.add_argument("--save", action="store_true")
     args = ap.parse_args()
@@ -1145,6 +1161,7 @@ def main():
 
     branch = resolve_branch_mode(args.elbow_branch)
     shape = resolve_shape_name(args.shape)
+    shape_plane = resolve_shape_plane(args.shape_plane)
     rng = np.random.default_rng(args.seed)
     ee, joints, ws = _load_reachable_workspace(args.ws_cache)
     user_center = np.array(args.center, dtype=np.float64) if args.center else None
@@ -1158,6 +1175,7 @@ def main():
             branch, ee, joints, ws, rng, refine,
             center=user_center if ti == 0 else None,
             theta=args.theta if ti == 0 else None,
+            shape_plane=shape_plane,
         )
         if traj is None:
             print(f"  轨迹 {ti + 1} 失败（中心不可行）")
